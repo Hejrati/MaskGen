@@ -16,7 +16,13 @@ limitations under the License.
 """
 
 import torch
-from einops import rearrange
+try:
+    from einops import rearrange
+except Exception:
+    def rearrange(tensor, pattern):
+        if pattern.replace(" ", "") == "bhwc->bchw":
+            return tensor.permute(0, 3, 1, 2)
+        raise RuntimeError("einops is required for pattern: " + pattern)
 
 from .titok import TiTok
 from modeling.modules.blocks import TATiTokDecoder
