@@ -6,3 +6,4 @@ __pycache__
 hf_cache/*
 outputs/*
 geneval/
+dataset
