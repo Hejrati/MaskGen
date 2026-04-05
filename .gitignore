@@ -5,3 +5,4 @@ yolov8x.pt
 __pycache__
 hf_cache/*
 outputs/*
+geneval/
