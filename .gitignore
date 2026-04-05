@@ -1,5 +1,7 @@
 /datasets/*
+dataset/*
 /evaluation_results/*
 yolov8x.pt
 __pycache__
-maskgen_t2i_evaluation *.ipynb
+hf_cache/*
+outputs/*

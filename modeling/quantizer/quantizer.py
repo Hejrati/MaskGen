@@ -25,7 +25,6 @@ from typing import Mapping, Text, Tuple
 import torch
 from einops import rearrange
 from accelerate.utils.operations import gather
-from torch.cuda.amp import autocast
 
 class VectorQuantizer(torch.nn.Module):
     def __init__(self,
@@ -50,7 +49,7 @@ class VectorQuantizer(torch.nn.Module):
             self.register_buffer("embed_prob", torch.zeros(self.codebook_size))
 
     # Ensure quantization is performed using f32
-    @autocast(enabled=False)
+    @torch.amp.autocast("cuda", enabled=False)
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, Mapping[Text, torch.Tensor]]:
         z = z.float()
         z = rearrange(z, 'b c h w -> b h w c').contiguous()
@@ -131,7 +130,7 @@ class VectorQuantizer(torch.nn.Module):
     
 
 class DiagonalGaussianDistribution(object):
-    @autocast(enabled=False)
+    @torch.amp.autocast("cuda", enabled=False)
     def __init__(self, parameters, deterministic=False):
         """Initializes a Gaussian distribution instance given the parameters.
 
@@ -151,16 +150,16 @@ class DiagonalGaussianDistribution(object):
         if self.deterministic:
             self.var = self.std = torch.zeros_like(self.mean).to(device=self.parameters.device)
 
-    @autocast(enabled=False)
+    @torch.amp.autocast("cuda", enabled=False)
     def sample(self):
         x = self.mean.float() + self.std.float() * torch.randn(self.mean.shape).to(device=self.parameters.device)
         return x
 
-    @autocast(enabled=False)
+    @torch.amp.autocast("cuda", enabled=False)
     def mode(self):
         return self.mean
 
-    @autocast(enabled=False)
+    @torch.amp.autocast("cuda", enabled=False)
     def kl(self):
         if self.deterministic:
             return torch.Tensor([0.])
