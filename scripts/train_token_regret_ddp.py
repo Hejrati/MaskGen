@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import io
 import json
@@ -33,7 +34,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from modeling.tatitok import TATiTok
-from modeling.maskgen import MaskGen_VQ, get_masking_ratio
+from modeling.maskgen import MaskGen_VQ, get_masking_ratio, open_clip_text_encoding
 
 
 def is_dist():
@@ -275,34 +276,92 @@ def _images_to_tokens(tokenizer, images, expected_seq_len):
 
 
 def _iter_cc12m_tsv_batches(tsv_path, batch_size, rank=0, world_size=1, cache_dir=None, cache_images=True):
+    return _iter_cc12m_tsv_batches_parallel(
+        tsv_path=tsv_path,
+        batch_size=batch_size,
+        rank=rank,
+        world_size=world_size,
+        cache_dir=cache_dir,
+        cache_images=cache_images,
+        loader_workers=max(4, min(64, (os.cpu_count() or 8) * 2)),
+        max_pending=0,
+    )
+
+
+def _iter_cc12m_tsv_batches_parallel(
+    tsv_path,
+    batch_size,
+    rank=0,
+    world_size=1,
+    cache_dir=None,
+    cache_images=True,
+    loader_workers=16,
+    max_pending=0,
+):
     batch_images = []
     batch_captions = []
     rank = int(rank)
     world_size = max(1, int(world_size))
     cache_dir = _ensure_cc12m_cache_dir(cache_dir) if bool(cache_images) else None
+    loader_workers = max(1, int(loader_workers))
+    if int(max_pending) <= 0:
+        max_pending = loader_workers * 4
+    max_pending = max(loader_workers, int(max_pending))
 
-    with open(tsv_path, "r", encoding="utf-8") as f:
-        for line_idx, line in enumerate(f):
-            if world_size > 1 and (line_idx % world_size) != rank:
-                continue
-            line = line.strip()
-            if not line or "\t" not in line:
-                continue
-            image_url, caption = line.split("\t", 1)
-            image_url = image_url.strip()
-            caption = caption.strip()
-            if not image_url or not caption:
-                continue
-            try:
-                image = _fetch_cc12m_image(image_url, cache_dir=cache_dir, use_cache=bool(cache_images))
-            except Exception:
-                continue
+    def _load_image_task(image_url):
+        try:
+            image = _fetch_cc12m_image(image_url, cache_dir=cache_dir, use_cache=bool(cache_images))
+            return image
+        except Exception:
+            return None
 
-            batch_images.append(image)
-            batch_captions.append(caption)
-            if len(batch_images) >= int(batch_size):
-                out = (batch_images, batch_captions)
-                batch_images, batch_captions = [], []
+    with ThreadPoolExecutor(max_workers=loader_workers) as pool:
+        futures = {}
+
+        def _drain_done(wait_mode):
+            nonlocal batch_images, batch_captions
+            if not futures:
+                return
+            done, _ = wait(list(futures.keys()), return_when=wait_mode)
+            for fut in done:
+                caption = futures.pop(fut)
+                image = fut.result()
+                if image is None:
+                    continue
+                batch_images.append(image)
+                batch_captions.append(caption)
+
+        with open(tsv_path, "r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f):
+                if world_size > 1 and (line_idx % world_size) != rank:
+                    continue
+                line = line.strip()
+                if not line or "\t" not in line:
+                    continue
+                image_url, caption = line.split("\t", 1)
+                image_url = image_url.strip()
+                caption = caption.strip()
+                if not image_url or not caption:
+                    continue
+
+                fut = pool.submit(_load_image_task, image_url)
+                futures[fut] = caption
+
+                if len(futures) >= max_pending:
+                    _drain_done(FIRST_COMPLETED)
+
+                while len(batch_images) >= int(batch_size):
+                    out = (batch_images[: int(batch_size)], batch_captions[: int(batch_size)])
+                    batch_images = batch_images[int(batch_size):]
+                    batch_captions = batch_captions[int(batch_size):]
+                    yield out
+
+        while futures:
+            _drain_done(FIRST_COMPLETED)
+            while len(batch_images) >= int(batch_size):
+                out = (batch_images[: int(batch_size)], batch_captions[: int(batch_size)])
+                batch_images = batch_images[int(batch_size):]
+                batch_captions = batch_captions[int(batch_size):]
                 yield out
 
     if len(batch_images) > 0:
@@ -318,22 +377,25 @@ def _iter_hf_stream_batches(
     retry_sleep=2.0,
     cc12m_cache_dir=None,
     cc12m_cache_images=True,
+    cc12m_loader_workers=16,
+    cc12m_max_pending=0,
 ):
     source = _normalize_dataset_source(urls)
     if source["kind"] == "cc12m_tsv":
-        yield from _iter_cc12m_tsv_batches(
+        yield from _iter_cc12m_tsv_batches_parallel(
             tsv_path=source["value"],
             batch_size=batch_size,
             rank=rank,
             world_size=world_size,
             cache_dir=cc12m_cache_dir,
             cache_images=cc12m_cache_images,
+            loader_workers=cc12m_loader_workers,
+            max_pending=cc12m_max_pending,
         )
         return
 
     batch_images = []
     batch_captions = []
-
     def _passthrough_nodesplitter(src, group=None):
         yield from src
 
@@ -390,6 +452,38 @@ def _iter_hf_stream_batches(
 
     if len(batch_images) > 0:
         yield batch_images, batch_captions
+
+
+def _prefetch_batches(iterable, prefetch_batches=4):
+    from queue import Queue
+    from threading import Thread
+
+    prefetch_batches = max(1, int(prefetch_batches))
+    queue = Queue(maxsize=prefetch_batches)
+    sentinel = object()
+    error_box = {}
+
+    def _worker():
+        try:
+            for item in iterable:
+                queue.put(item)
+        except Exception as exc:
+            error_box["exc"] = exc
+        finally:
+            queue.put(sentinel)
+
+    thread = Thread(target=_worker, daemon=True)
+    thread.start()
+
+    while True:
+        item = queue.get()
+        if item is sentinel:
+            break
+        yield item
+
+    thread.join()
+    if "exc" in error_box:
+        raise error_box["exc"]
 
 
 class TokenRegretCritic(nn.Module):
@@ -508,6 +602,297 @@ def pairwise_rank_loss(scores, regrets, valid_mask, margin=0.05):
     return total / count
 
 
+def load_critic_checkpoint(path, critic, optimizer=None, map_location="cpu"):
+    ckpt = torch.load(path, map_location=map_location)
+    critic.load_state_dict(ckpt["critic"], strict=True)
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    return ckpt
+
+
+def load_trained_critic(ckpt_path, model, use_hidden=True):
+    target_device = next(model.parameters()).device
+    critic = build_token_regret_critic(model, use_hidden=use_hidden).to(target_device)
+    _ = load_critic_checkpoint(ckpt_path, critic, optimizer=None, map_location=target_device)
+    critic.eval()
+    critic.requires_grad_(False)
+    return critic
+
+
+def prepare_text_guidance(text, clip_tokenizer, clip_encoder, device):
+    text_tokens = clip_tokenizer(text).to(device)
+    cast_dtype = clip_encoder.transformer.get_cast_dtype()
+    text_embed = clip_encoder.token_embedding(text_tokens).to(cast_dtype)
+    text_embed = text_embed + clip_encoder.positional_embedding.to(cast_dtype)
+    text_embed = text_embed.permute(1, 0, 2)
+    text_embed = clip_encoder.transformer(text_embed, attn_mask=clip_encoder.attn_mask)
+    text_embed = text_embed.permute(1, 0, 2)
+    text_guidance = clip_encoder.ln_final(text_embed)
+    return text_guidance.to(device)
+
+
+def _resolve_num_selected(seq_len, ratio_or_count, min_tokens=1):
+    value = float(ratio_or_count)
+    if value <= 0:
+        return 0
+    if value <= 1:
+        count = int(seq_len * value)
+    else:
+        count = int(value)
+    count = max(int(min_tokens), count)
+    return min(int(seq_len), count)
+
+
+def select_topk_token_positions(scores, remask_ratio, candidate_mask=None, min_tokens=1):
+    bsz, seq_len = scores.shape
+    k = _resolve_num_selected(seq_len, remask_ratio, min_tokens=min_tokens)
+    if k == 0:
+        return torch.zeros(bsz, 0, dtype=torch.long, device=scores.device), torch.zeros(bsz, 0, dtype=torch.bool, device=scores.device)
+    if candidate_mask is None:
+        candidate_mask = torch.ones_like(scores, dtype=torch.bool)
+    elif candidate_mask.dtype != torch.bool:
+        candidate_mask = candidate_mask.bool()
+    masked_scores = scores.masked_fill(~candidate_mask, float("-inf"))
+    idx = masked_scores.topk(k=k, dim=-1).indices
+    valid = candidate_mask.gather(dim=-1, index=idx)
+    return idx, valid
+
+
+def remask_positions(tokens, indices, mask_token_id, valid_mask=None):
+    out = tokens.clone()
+    if valid_mask is None:
+        valid_mask = torch.ones_like(indices, dtype=torch.bool)
+    gathered = out.gather(dim=-1, index=indices)
+    masked = torch.full_like(gathered, int(mask_token_id))
+    update = torch.where(valid_mask, masked, gathered)
+    return out.scatter(dim=-1, index=indices, src=update)
+
+
+@torch.no_grad()
+def forward_with_cfg_features(model, ids, condition, condition_pooled, none_cond, none_cond_pooled, cfg_scale, timestep_value, sample_aesthetic_score):
+    num_samples = ids.shape[0]
+    aes = None
+    if sample_aesthetic_score is not None and model.micro_condition:
+        aes_val = float(sample_aesthetic_score)
+        if cfg_scale != 0:
+            aes = torch.full((num_samples * 2,), aes_val, device=ids.device)
+        else:
+            aes = torch.full((num_samples,), aes_val, device=ids.device)
+
+    if cfg_scale != 0:
+        logits_all, hidden_all, text_all = forward_features_vq(
+            model,
+            torch.cat([ids, ids], dim=0),
+            torch.cat([condition, none_cond], dim=0),
+            torch.cat([condition_pooled, none_cond_pooled], dim=0),
+            aesthetic_score=aes,
+        )
+        cond_logits, uncond_logits = logits_all[:num_samples], logits_all[num_samples:]
+        logits = cond_logits + (cond_logits - uncond_logits) * cfg_scale
+        hidden = hidden_all[:num_samples]
+        text_feat = text_all[:num_samples]
+    else:
+        logits, hidden, text_feat = forward_features_vq(model, ids, condition, condition_pooled, aesthetic_score=aes)
+    timesteps = torch.full((num_samples,), float(timestep_value), device=ids.device)
+    return logits, hidden, text_feat, timesteps
+
+
+def _add_gumbel_noise(logits, temperature):
+    eps = 1e-20
+    noise = torch.rand_like(logits)
+    g = -torch.log(-torch.log(noise.clamp(min=eps)).clamp(min=eps))
+    return logits + float(temperature) * g
+
+
+@torch.no_grad()
+def build_uncertainty_candidate_mask(logits, margin_threshold=0.20):
+    probs = logits.softmax(dim=-1)
+    top2 = probs.topk(k=min(2, probs.shape[-1]), dim=-1).values
+    if top2.shape[-1] == 1:
+        margin = top2[..., 0]
+    else:
+        margin = top2[..., 0] - top2[..., 1]
+    return margin < float(margin_threshold)
+
+
+def refine_tokens_with_critic(
+    model,
+    draft_ids,
+    captions,
+    clip_tokenizer,
+    clip_encoder,
+    critic,
+    remask_ratio=0.05,
+    refine_loops=1,
+    refine_start_step=10,
+    num_sample_steps=16,
+    guidance_scale=12.0,
+    sample_aesthetic_score=6.5,
+    randomize_temperature=1.5,
+    critic_use_hidden=True,
+    score_gate_quantile=0.8,
+    score_gate_min=None,
+    margin_threshold=0.20,
+    refine_softmax_temperature=0.7,
+    use_gumbel_in_refine=False,
+):
+    condition, condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, captions)
+    none_cond, none_cond_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, [""])
+    none_cond = none_cond.repeat(condition.shape[0], 1, 1)
+    none_cond_pooled = none_cond_pooled.repeat(condition.shape[0], 1, 1)
+
+    ids = draft_ids.clone()
+    for loop_idx in range(int(refine_loops)):
+        ratio = float(refine_start_step + loop_idx + 1) / float(max(num_sample_steps, 1))
+        ratio = max(0.75, min(0.95, ratio))
+
+        logits, hidden, text_feat, timesteps = forward_with_cfg_features(
+            model,
+            ids,
+            condition,
+            condition_pooled,
+            none_cond,
+            none_cond_pooled,
+            cfg_scale=float(guidance_scale),
+            timestep_value=ratio,
+            sample_aesthetic_score=sample_aesthetic_score,
+        )
+
+        scores = critic(
+            hidden_states=hidden if critic_use_hidden else None,
+            logits=logits,
+            timesteps=timesteps,
+            text_features=text_feat,
+        )
+
+        candidate_mask = build_uncertainty_candidate_mask(logits, margin_threshold=margin_threshold)
+        select_idx, select_valid = select_topk_token_positions(
+            scores,
+            remask_ratio,
+            candidate_mask=candidate_mask,
+        )
+        select_scores = scores.gather(dim=-1, index=select_idx)
+
+        if score_gate_quantile is not None:
+            gate_threshold = torch.quantile(
+                scores,
+                q=max(0.0, min(1.0, float(score_gate_quantile))),
+                dim=-1,
+                keepdim=True,
+            )
+            select_valid = select_valid & (select_scores >= gate_threshold)
+
+        if score_gate_min is not None:
+            select_valid = select_valid & (select_scores >= float(score_gate_min))
+
+        ids = remask_positions(ids, select_idx, model.mask_token_id, valid_mask=select_valid)
+
+        logits_resample, _, _, _ = forward_with_cfg_features(
+            model,
+            ids,
+            condition,
+            condition_pooled,
+            none_cond,
+            none_cond_pooled,
+            cfg_scale=float(guidance_scale),
+            timestep_value=ratio,
+            sample_aesthetic_score=sample_aesthetic_score,
+        )
+
+        mask_token_id = int(model.mask_token_id)
+        if 0 <= mask_token_id < logits_resample.shape[-1]:
+            logits_resample[..., mask_token_id] = -1e9
+        logits_resample = logits_resample / float(refine_softmax_temperature)
+
+        if use_gumbel_in_refine:
+            sampled_ids = _add_gumbel_noise(logits_resample, float(randomize_temperature)).argmax(dim=-1)
+        else:
+            sampled_ids = logits_resample.argmax(dim=-1)
+
+        is_mask = ids.eq(model.mask_token_id)
+        ids = torch.where(is_mask, sampled_ids, ids)
+
+    if ids.eq(int(model.mask_token_id)).any():
+        raise RuntimeError("Refinement left mask tokens in the final token grid.")
+
+    return ids
+
+
+@torch.no_grad()
+def generate_image_vq_batch(
+    prompts,
+    model,
+    tokenizer,
+    clip_tokenizer,
+    clip_encoder,
+    guidance_scale=12.0,
+    randomize_temperature=1.5,
+    aesthetic_score=6.5,
+    num_sample_steps=16,
+    use_regret_remask=False,
+    critic=None,
+    remask_ratio=0.05,
+    refine_loops=1,
+    refine_start_step=10,
+    critic_use_hidden=True,
+    score_gate_quantile=0.8,
+    score_gate_min=None,
+    margin_threshold=0.20,
+    refine_softmax_temperature=0.7,
+    use_gumbel_in_refine=False,
+    device="cuda",
+):
+    model_device = next(model.parameters()).device
+    if next(clip_encoder.parameters()).device != model_device:
+        clip_encoder = clip_encoder.to(model_device)
+    if next(tokenizer.parameters()).device != model_device:
+        tokenizer = tokenizer.to(model_device)
+    if isinstance(device, str):
+        device = model_device
+    tokens = model.generate(
+        captions=prompts,
+        guidance_scale=guidance_scale,
+        randomize_temperature=randomize_temperature,
+        sample_aesthetic_score=aesthetic_score,
+        num_sample_steps=num_sample_steps,
+        clip_tokenizer=clip_tokenizer,
+        clip_encoder=clip_encoder,
+    )
+    tokens = tokens.to(model_device)
+    if use_regret_remask:
+        if critic is None:
+            raise ValueError("use_regret_remask=True but critic is None")
+        critic_device = next(critic.parameters()).device
+        if critic_device != model_device:
+            critic = critic.to(model_device)
+        tokens = refine_tokens_with_critic(
+            model=model,
+            draft_ids=tokens,
+            captions=prompts,
+            clip_tokenizer=clip_tokenizer,
+            clip_encoder=clip_encoder,
+            critic=critic,
+            remask_ratio=remask_ratio,
+            refine_loops=refine_loops,
+            refine_start_step=refine_start_step,
+            num_sample_steps=int(num_sample_steps),
+            guidance_scale=float(guidance_scale),
+            sample_aesthetic_score=float(aesthetic_score),
+            randomize_temperature=float(randomize_temperature),
+            critic_use_hidden=bool(critic_use_hidden),
+            score_gate_quantile=score_gate_quantile,
+            score_gate_min=score_gate_min,
+            margin_threshold=margin_threshold,
+            refine_softmax_temperature=refine_softmax_temperature,
+            use_gumbel_in_refine=use_gumbel_in_refine,
+        )
+    text_guidance = prepare_text_guidance(prompts, clip_tokenizer, clip_encoder, model_device)
+    image = tokenizer.decode_tokens(tokens, text_guidance)
+    image = torch.clamp(image, 0.0, 1.0)
+    image = (image * 255.0).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+    return [Image.fromarray(arr) for arr in image]
+
+
 def save_critic_checkpoint(path, critic, optimizer, step, config_dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
@@ -535,6 +920,9 @@ def main():
     parser.add_argument("--train-data-source", type=str, nargs="*", default=None)
     parser.add_argument("--cc12m-cache-dir", type=str, default=_default_cc12m_cache_dir())
     parser.add_argument("--disable-cc12m-cache", action="store_true")
+    parser.add_argument("--cc12m-loader-workers", type=int, default=max(4, min(64, (os.cpu_count() or 8) * 2)))
+    parser.add_argument("--cc12m-loader-max-pending", type=int, default=0)
+    parser.add_argument("--stream-prefetch-batches", type=int, default=0)
     args = parser.parse_args()
 
     gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -613,6 +1001,7 @@ def main():
     cc12m_cache_dir = _ensure_cc12m_cache_dir(args.cc12m_cache_dir) if use_cc12m_cache else None
     if is_main_process() and source["kind"] == "cc12m_tsv":
         print(f"CC12M image cache: {'disabled' if not use_cc12m_cache else cc12m_cache_dir}")
+        print(f"CC12M loader workers: {int(args.cc12m_loader_workers)}")
 
     dataset_examples = _infer_total_examples_from_urls(urls)
     steps_per_epoch = None
@@ -645,15 +1034,24 @@ def main():
             json.dump(cfg, f, indent=2)
 
     default_aes = float(getattr(model, "sample_aesthetic_score", 6.5))
+    if int(args.stream_prefetch_batches) > 0:
+        stream_prefetch_batches = int(args.stream_prefetch_batches)
+    else:
+        stream_prefetch_batches = max(1, min(8, max(2, int(args.per_gpu_batch_size) // 64)))
 
     for _ in range(int(args.num_epochs)):
-        stream = _iter_hf_stream_batches(
-            urls=urls,
-            batch_size=int(args.per_gpu_batch_size),
-            rank=rank,
-            world_size=world_size,
-            cc12m_cache_dir=cc12m_cache_dir,
-            cc12m_cache_images=use_cc12m_cache,
+        stream = _prefetch_batches(
+            _iter_hf_stream_batches(
+                urls=urls,
+                batch_size=int(args.per_gpu_batch_size),
+                rank=rank,
+                world_size=world_size,
+                cc12m_cache_dir=cc12m_cache_dir,
+                cc12m_cache_images=use_cc12m_cache,
+                cc12m_loader_workers=int(args.cc12m_loader_workers),
+                cc12m_max_pending=int(args.cc12m_loader_max_pending),
+            ),
+            prefetch_batches=stream_prefetch_batches,
         )
         for images, captions in stream:
             gt_tokens = _images_to_tokens(tokenizer, images, int(model.image_seq_len)).to(device, non_blocking=True)
