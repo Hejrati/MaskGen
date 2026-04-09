@@ -7,3 +7,5 @@ hf_cache/*
 outputs/*
 geneval/
 dataset
+.codex
+*.pdf
