@@ -16,23 +16,31 @@ def get_config():
     config.training.per_gpu_batch_size = 128
     config.training.learning_rate = 2e-4
     config.training.lambda_rank = 0.1
-    config.training.rank_margin = 0.05 # margin threshold for pairwise ranking loss
-    config.training.token_sample_ratio = 0.2 # check whther exist in train loop
-    config.training.counterfactual_chunk_size = 64 # check whther exist in train loop
+    config.training.rank_margin = 0.05
+    config.training.token_sample_ratio = 0.2
+    config.training.counterfactual_chunk_size = 64
+    config.training.training_random_fraction = 0.5
+    config.training.training_low_margin_fraction = 0.25
+    config.training.training_critic_fraction = 0.25
     config.training.ddp_only = False
     config.training.dist_backend = "gloo"
-    config.training.rollout_prob = 0.7
     config.training.train_guidance_scale = 12.0
     config.training.train_randomize_temperature = 1.5
     config.training.train_aesthetic_score = 6.5
-    config.training.train_remask_ratio = 0.10 # check whther exist in train loop
+    config.training.train_remask_ratio = 0.10
     config.training.train_refine_start_step = 10
-    config.training.margin_threshold = 0.20 # check whther exist in train loop
-    config.training.neighborhood_radius = 0 # check whther exist in train loop
-    config.training.utility_sign = 1.0 # check whther exist in train loop
-    config.training.target_transform = "zscore_tanh" # check whther exist in train loop
-    config.training.target_scale = 1.0 # check whther exist in train loop
-    config.training.target_zclip = 3.0 # check whther exist in train loop
+    config.training.margin_threshold = 0.20  # Backward-compatible no-op; TRC remasking is top-k by regret.
+    config.training.neighborhood_radius = 0
+    config.training.target_transform = "zscore_tanh"
+    config.training.target_scale = 1.0
+    config.training.target_zclip = 3.0
+    config.training.regression_loss = "huber"
+    config.training.huber_beta = 0.5
+    config.training.grad_clip_norm = 1.0
+    config.training.dagger_prob_start = 0.0
+    config.training.dagger_prob_end = 0.25
+    config.training.dagger_anneal_steps = 2000
+    config.training.dagger_selection_noise = False
     config.training.refine_loops = 1
     config.training.save_every = 5 
     config.training.log_every = 1
@@ -42,6 +50,7 @@ def get_config():
     config.inference.refine_loops = config.training.refine_loops
     config.inference.remask_ratio = config.training.train_remask_ratio
     config.inference.refine_start_step = config.training.train_refine_start_step
+    config.inference.repair_greedy = True
 
     config.dataset = config_dict.ConfigDict()
     config.dataset.mode = "cc12m"
@@ -56,6 +65,8 @@ def get_config():
     config.model.generator_path = "hf_cache/turkeyju/generator_maskgen_vq_xl"
     config.model.tokenizer_path = "hf_cache/turkeyju/tokenizer_tatitok_bl128_vq"
     config.model.clip_name = "ViT-L-14-336"
+    config.model.clip_pretrained = "openai"
+    config.model.clip_force_quick_gelu = True
     config.model.sample_steps = 16
 
     config.logging = config_dict.ConfigDict()
@@ -64,7 +75,7 @@ def get_config():
     config.logging.metrics_path = "outputs/token_regret_critic/logs/metrics.jsonl"
 
     config.runtime = config_dict.ConfigDict()
-    config.runtime.resume_checkpoint = "outputs/token_regret_critic/critic_step_35.pt"
+    config.runtime.resume_checkpoint = "outputs/token_regret_critic/critic_last.pt"
     config.runtime.world_size = 1
     config.runtime.ddp = False
     config.runtime.local_rank = 0

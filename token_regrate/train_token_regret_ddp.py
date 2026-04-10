@@ -27,90 +27,6 @@ from token_regrate.train_token_regret_dataset import *
 from token_regrate.utils import *
 
 
-def _center_crop_arr(pil_image, image_size):
-    """Resize then center-crop a PIL image to a square size."""
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
-
-
-def _tokenizer_image_size(tokenizer):
-    """Read tokenizer input size from config, falling back to 256."""
-    cfg = getattr(tokenizer, "config", None)
-    size = None
-    if cfg is not None:
-        try:
-            size = int(cfg.model.vq_model.image_size)
-        except Exception:
-            size = None
-    return size if size is not None and size > 0 else 256
-
-
-def _images_to_tokens(tokenizer, images, expected_seq_len):
-    """Convert PIL images into discrete tokenizer token grids."""
-    image_size = _tokenizer_image_size(tokenizer)
-    tokenizer_device = next(tokenizer.parameters()).device
-    proc = []
-    for img in images:
-        crop = _center_crop_arr(img.convert("RGB"), image_size)
-        arr = np.asarray(crop, dtype=np.float32) / 255.0
-        ten = torch.from_numpy(arr).permute(2, 0, 1)
-        proc.append(ten)
-    x = torch.stack(proc, dim=0).to(tokenizer_device, non_blocking=True)
-
-    with torch.no_grad():
-        _, result_dict = tokenizer.encode(x)
-    token_grid = result_dict["min_encoding_indices"].long()
-    tokens = token_grid.view(token_grid.shape[0], -1)
-
-    if tokens.shape[1] != int(expected_seq_len):
-        raise ValueError(
-            f"Token length mismatch: got {tokens.shape[1]}, expected {int(expected_seq_len)}. "
-            "Check tokenizer/image size compatibility with the generator."
-        )
-    return tokens
-
-
-def _prefetch_batches(iterable, prefetch_batches=4):
-    """Prefetch iterable items on a background thread to overlap I/O and compute."""
-    from queue import Queue
-    from threading import Thread
-
-    prefetch_batches = max(1, int(prefetch_batches))
-    queue = Queue(maxsize=prefetch_batches)
-    sentinel = object()
-    error_box = {}
-
-    def _worker():
-        """Producer thread that fills queue and forwards exceptions."""
-        try:
-            for item in iterable:
-                queue.put(item)
-        except Exception as exc:
-            error_box["exc"] = exc
-        finally:
-            queue.put(sentinel)
-
-    thread = Thread(target=_worker, daemon=True)
-    thread.start()
-
-    while True:
-        item = queue.get()
-        if item is sentinel:
-            break
-        yield item
-
-    thread.join()
-    if "exc" in error_box:
-        raise error_box["exc"]
-
-
-
 @torch.no_grad()
 def forward_maskgen(
     model,
@@ -118,12 +34,11 @@ def forward_maskgen(
     condition,
     condition_pooled,
     sample_aesthetic_score=6.5,
-    aesthetic_score=None,
 ):
     """Forward MaskGen blocks and return logits, hidden states (x), and pooled text feature (condition_pooled).
     This is based on forward in Maskgen_VQ but adapted to return intermediate features"""
     if sample_aesthetic_score is not None:
-            sample_aesthetic_score = torch.full((input_ids.shape[0],), sample_aesthetic_score, device=input_ids.device)
+        sample_aesthetic_score = torch.full((input_ids.shape[0],), sample_aesthetic_score, device=input_ids.device)
 
 
     embeddings = model.embeddings(input_ids)
@@ -141,28 +56,127 @@ def forward_maskgen(
     return logits, x, condition_pooled.squeeze(1)
 
 
-def sample_masked_state(model, gt_tokens, timesteps):
-    """Sample a masked token state z_t using the model masking schedule."""
-    bsz, seq_len = gt_tokens.shape
-    mask_ratio = get_masking_ratio(timesteps, model.mask_schedule_strategy)
-    mask_ratio = torch.clamp(mask_ratio, min=1e-6, max=1.0)
-    num_masked = (seq_len * mask_ratio).round().clamp(min=1)
-    randperm = torch.rand(bsz, seq_len, device=gt_tokens.device).argsort(dim=-1)
-    masks = randperm < num_masked.unsqueeze(1)
-    z_t = torch.where(masks, torch.full_like(gt_tokens, int(model.mask_token_id)), gt_tokens)
-    return z_t, masks
-
-
-def select_token_subset(candidate_mask, sample_ratio, min_tokens=1):
+def select_token_subset(candidate_mask, ratio_or_count, min_tokens=1):
     """Randomly select a fixed-size subset of candidate token positions."""
     bsz, seq_len = candidate_mask.shape
-    k = max(int(min_tokens), int(seq_len * float(sample_ratio)))
-    k = min(seq_len, k)
+    k = _resolve_num_selected(seq_len, ratio_or_count, min_tokens=min_tokens)
+    if k == 0:
+        return (
+            torch.zeros(bsz, 0, dtype=torch.long, device=candidate_mask.device),
+            torch.zeros(bsz, 0, dtype=torch.bool, device=candidate_mask.device),
+        )
     scores = torch.rand(bsz, seq_len, device=candidate_mask.device)
     scores = scores.masked_fill(~candidate_mask, -1.0)
     idx = scores.topk(k=k, dim=-1).indices
     valid = candidate_mask.gather(dim=-1, index=idx)
     return idx, valid
+
+
+def _allocate_selection_counts(total, weights):
+    """Split an integer budget across weighted buckets."""
+    total = max(0, int(total))
+    weights = [max(0.0, float(w)) for w in weights]
+    if total == 0:
+        return [0 for _ in weights]
+    weight_sum = sum(weights)
+    if weight_sum <= 0.0:
+        counts = [0 for _ in weights]
+        counts[0] = total
+        return counts
+
+    raw = [total * (w / weight_sum) for w in weights]
+    counts = [int(math.floor(v)) for v in raw]
+    remainder = total - sum(counts)
+    order = sorted(range(len(raw)), key=lambda i: raw[i] - counts[i], reverse=True)
+    for idx in order[:remainder]:
+        counts[idx] += 1
+    return counts
+
+
+def compute_logit_margin(logits):
+    """Return top-1 minus top-2 logit margin per token."""
+    topk = torch.topk(logits, k=min(2, logits.shape[-1]), dim=-1).values
+    if topk.shape[-1] < 2:
+        return torch.zeros(logits.shape[:2], device=logits.device, dtype=logits.dtype)
+    return topk[..., 0] - topk[..., 1]
+
+
+def _mask_out_selected(candidate_mask, idx, valid):
+    """Remove already-selected valid indices from a candidate mask."""
+    if idx.numel() == 0:
+        return candidate_mask
+    selected_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+    selected_mask.scatter_(dim=-1, index=idx, src=valid.bool())
+    return candidate_mask & ~selected_mask
+
+
+def select_mixed_token_subset(
+    candidate_mask,
+    ratio_or_count,
+    logits=None,
+    critic_scores=None,
+    random_fraction=0.5,
+    low_margin_fraction=0.25,
+    critic_fraction=0.25,
+    min_tokens=1,
+):
+    """Mix random, low-margin, and critic-prioritized token sampling for supervision."""
+    bsz, seq_len = candidate_mask.shape
+    total = _resolve_num_selected(seq_len, ratio_or_count, min_tokens=min_tokens)
+    if total == 0:
+        return (
+            torch.zeros(bsz, 0, dtype=torch.long, device=candidate_mask.device),
+            torch.zeros(bsz, 0, dtype=torch.bool, device=candidate_mask.device),
+        )
+
+    weights = [random_fraction, low_margin_fraction if logits is not None else 0.0, critic_fraction if critic_scores is not None else 0.0]
+    random_count, low_margin_count, critic_count = _allocate_selection_counts(total, weights)
+
+    parts_idx = []
+    parts_valid = []
+    remaining_mask = candidate_mask.bool()
+
+    if random_count > 0:
+        idx, valid = select_token_subset(remaining_mask, random_count, min_tokens=0)
+        parts_idx.append(idx)
+        parts_valid.append(valid)
+        remaining_mask = _mask_out_selected(remaining_mask, idx, valid)
+
+    if low_margin_count > 0 and logits is not None:
+        low_margin_scores = -compute_logit_margin(logits)
+        idx, valid = select_topk_token_positions(
+            low_margin_scores,
+            low_margin_count,
+            candidate_mask=remaining_mask,
+            min_tokens=0,
+        )
+        parts_idx.append(idx)
+        parts_valid.append(valid)
+        remaining_mask = _mask_out_selected(remaining_mask, idx, valid)
+
+    if critic_count > 0 and critic_scores is not None:
+        idx, valid = select_topk_token_positions(
+            critic_scores,
+            critic_count,
+            candidate_mask=remaining_mask,
+            min_tokens=0,
+        )
+        parts_idx.append(idx)
+        parts_valid.append(valid)
+        remaining_mask = _mask_out_selected(remaining_mask, idx, valid)
+
+    selected_total = sum(part.shape[1] for part in parts_idx)
+    if selected_total < total:
+        idx, valid = select_token_subset(remaining_mask, total - selected_total, min_tokens=0)
+        parts_idx.append(idx)
+        parts_valid.append(valid)
+
+    if not parts_idx:
+        return (
+            torch.zeros(bsz, 0, dtype=torch.long, device=candidate_mask.device),
+            torch.zeros(bsz, 0, dtype=torch.bool, device=candidate_mask.device),
+        )
+    return torch.cat(parts_idx, dim=-1), torch.cat(parts_valid, dim=-1)
 
 
 def pairwise_rank_loss(scores, utilities, valid_mask, margin=0.05):
@@ -200,20 +214,20 @@ def normalize_utility_per_sample(utility, valid_mask, eps=1e-4, z_clip=3.0):
 
 
 @torch.no_grad()
-def build_utility_targets(proxy_utility, valid_mask, transform="zscore_tanh", target_scale=1.0, target_zclip=3.0):
+def build_utility_targets(counterfactual_utility, valid_mask, transform="zscore_tanh", target_scale=1.0, target_zclip=3.0):
     """
-    Convert proxy utility into regression targets and rank utilities.
+    Convert counterfactual regret values into regression targets and rank utilities.
     `zscore_tanh` is the default to prevent near-constant targets from tanh saturation.
     """
     mode = str(transform).strip().lower()
     scale = max(float(target_scale), 1e-6)
 
     if mode == "raw_tanh":
-        rank_utility = proxy_utility
+        rank_utility = counterfactual_utility
         targets = torch.tanh(rank_utility / scale)
         return targets, rank_utility
     if mode == "zscore_tanh":
-        rank_utility = normalize_utility_per_sample(proxy_utility, valid_mask, z_clip=float(target_zclip))
+        rank_utility = normalize_utility_per_sample(counterfactual_utility, valid_mask, z_clip=float(target_zclip))
         targets = torch.tanh(rank_utility / scale)
         return targets, rank_utility
     raise ValueError(f"Unsupported target transform: {transform}")
@@ -282,61 +296,102 @@ def _add_gumbel_noise(logits, temperature):
 
 
 @torch.no_grad()
-def build_low_score_candidate_mask(scores, threshold=0.20):
-    """Select low-score positions (e.g., low confidence) for potential remasking."""
-    thresh = float(threshold)
-    if scores.numel() == 0:
-        return torch.zeros_like(scores, dtype=torch.bool)
-    if 0.0 < thresh < 1.0:
-        cutoff = torch.quantile(scores, q=thresh, dim=-1, keepdim=True)
-        return scores <= cutoff
-    return scores <= thresh
+def compute_token_nll(logits, gt_tokens):
+    """Compute token-level NLL against ground-truth image tokens."""
+    return F.cross_entropy(logits.transpose(1, 2), gt_tokens, reduction="none")
 
 
 @torch.no_grad()
-def build_high_score_candidate_mask(scores, threshold=0.20):
-    """Select high-score positions (e.g., high revision utility) for potential remasking."""
-    if scores.numel() == 0:
-        return torch.zeros_like(scores, dtype=torch.bool)
-    if 0.0 < threshold < 1.0:
-        cutoff = torch.quantile(scores, q=1.0 - threshold, dim=-1, keepdim=True)
-        return scores >= cutoff
-    return scores >= threshold
-
-
-@torch.no_grad()
-def build_mixed_training_candidate_mask(
-    critic_scores,
-    logits,
-    base_mask,
-    utility_threshold=0.20,
-    random_fraction=0.10,
+def compute_counterfactual_regret(
+    model,
+    z_t,
+    gt_tokens,
+    condition,
+    condition_pooled,
+    selected_idx,
+    selected_valid,
+    sample_aesthetic_score=6.5,
+    nll_orig=None,
+    counterfactual_chunk_size=64,
+    neighborhood_radius=0,
 ):
-    """
-    Mix critic-selected, high-entropy, low-confidence, and random positions.
-    This widens supervision coverage and reduces critic self-selection bias.
-    """
-    if base_mask.numel() == 0:
-        return torch.zeros_like(base_mask, dtype=torch.bool)
+    """Estimate token regret by explicitly remasking selected tokens and recomputing loss."""
+    if nll_orig is None:
+        logits_orig, _, _ = forward_maskgen(
+            model,
+            z_t,
+            condition,
+            condition_pooled,
+            sample_aesthetic_score=sample_aesthetic_score,
+        )
+        nll_orig = compute_token_nll(logits_orig, gt_tokens)
 
-    probs = torch.softmax(logits, dim=-1)
-    entropy = -(probs * torch.log(probs.clamp(min=1e-8))).sum(dim=-1)
-    max_prob = probs.max(dim=-1).values
+    counterfactual_regrets = torch.zeros_like(selected_idx, dtype=nll_orig.dtype)
+    pair = torch.nonzero(selected_valid, as_tuple=False)
+    if pair.numel() == 0:
+        return counterfactual_regrets
 
-    utility_mask = build_high_score_candidate_mask(critic_scores, threshold=utility_threshold)
-    entropy_mask = build_high_score_candidate_mask(entropy, threshold=utility_threshold)
-    low_conf_mask = build_low_score_candidate_mask(max_prob, threshold=utility_threshold)
+    seq_len = int(gt_tokens.shape[1])
+    chunk_size = max(1, int(counterfactual_chunk_size))
+    for start in range(0, pair.shape[0], chunk_size):
+        part = pair[start:start + chunk_size]
+        if part.numel() == 0:
+            continue
+        b_idx = part[:, 0]
+        k_idx = part[:, 1]
+        tok_idx = selected_idx[b_idx, k_idx]
 
-    rand_frac = float(random_fraction)
-    if rand_frac <= 0.0:
-        rand_frac = float(utility_threshold) if 0.0 < float(utility_threshold) < 1.0 else 0.10
-    rand_frac = max(0.0, min(1.0, rand_frac))
-    random_mask = torch.rand(base_mask.shape, device=base_mask.device) < rand_frac
+        z_cf = z_t[b_idx].clone()
+        z_cf[torch.arange(z_cf.shape[0], device=z_cf.device), tok_idx] = int(model.mask_token_id)
 
-    mixed = (utility_mask | entropy_mask | low_conf_mask | random_mask) & base_mask.bool()
-    no_candidates = ~mixed.any(dim=-1, keepdim=True)
-    mixed = torch.where(no_candidates, base_mask.bool(), mixed)
-    return mixed
+        logits_cf, _, _ = forward_maskgen(
+            model,
+            z_cf,
+            condition[b_idx],
+            condition_pooled[b_idx],
+            sample_aesthetic_score=sample_aesthetic_score,
+        )
+        nll_cf_all = compute_token_nll(logits_cf, gt_tokens[b_idx])
+
+        neigh_idx, neigh_valid = build_local_neighborhood_index(
+            seq_len=seq_len,
+            token_indices=tok_idx,
+            radius=int(neighborhood_radius),
+        )
+        neigh_valid = neigh_valid.to(nll_orig.dtype)
+        orig_patch = nll_orig[b_idx].gather(dim=-1, index=neigh_idx)
+        cf_patch = nll_cf_all.gather(dim=-1, index=neigh_idx)
+
+        patch_regret = (orig_patch - cf_patch) * neigh_valid
+        valid_count = neigh_valid.sum(dim=-1).clamp(min=1.0)
+        counterfactual_regrets[b_idx, k_idx] = patch_regret.sum(dim=-1) / valid_count
+
+    return counterfactual_regrets
+
+
+@torch.no_grad()
+def masked_pearson_corr(x, y, valid_mask, eps=1e-8):
+    """Compute a masked Pearson correlation for critic-vs-regret sanity checks."""
+    keep = valid_mask.bool()
+    if keep.sum() < 2:
+        return x.new_tensor(0.0)
+    x_keep = x[keep].float()
+    y_keep = y[keep].float()
+    x_keep = x_keep - x_keep.mean()
+    y_keep = y_keep - y_keep.mean()
+    denom = torch.sqrt(x_keep.pow(2).mean() * y_keep.pow(2).mean()).clamp(min=float(eps))
+    return (x_keep * y_keep).mean() / denom
+
+
+def schedule_linear_value(step, start_value, end_value, anneal_steps):
+    """Linearly interpolate a scalar schedule from start to end."""
+    start_value = float(start_value)
+    end_value = float(end_value)
+    anneal_steps = int(anneal_steps)
+    if anneal_steps <= 0:
+        return end_value
+    progress = max(0.0, min(1.0, float(step) / float(anneal_steps)))
+    return start_value + (end_value - start_value) * progress
 
 
 def _compute_cfg_scale(ratio, guidance_scale, guidance_decay, guidance_decay_scale_pow, device):
@@ -417,13 +472,21 @@ def build_rollout_state(
     prob_sorting=True,
     refine_loops=1,
     refine_start_step=10,
+    counterfactual_sample_ratio=0.20,
+    counterfactual_chunk_size=64,
+    neighborhood_radius=0,
+    critic=None,
+    critic_use_hidden=True,
+    critic_policy_prob=0.0,
+    critic_selection_noise=False,
 ):
     """
     Build a training state closer to inference:
     1) generate a draft with the same protocol as `generate()`
-    2) remask low-confidence positions using logit confidence
+    2) remask top-k positions chosen by explicit counterfactual regret
     """
     assert guidance_decay in ["linear", "cosine", "none", "flippedcosine"]
+    _ = margin_threshold  # Kept for backwards compatibility; TRC uses top-k counterfactual regret.
     draft_ids = generate_wrapper(
         model=model,
         captions=captions,
@@ -467,7 +530,7 @@ def build_rollout_state(
             torch.cat([draft_ids, draft_ids], dim=0),
             torch.cat([condition, none_cond], dim=0),
             torch.cat([condition_pooled, none_cond_pooled], dim=0),
-            aesthetic_score=sample_aesthetic_score,
+            sample_aesthetic_score=sample_aesthetic_score,
         )
         cond_logits, uncond_logits = logits_all[:num_samples], logits_all[num_samples:]
         logits = cond_logits + (cond_logits - uncond_logits) * cfg_scale
@@ -477,7 +540,7 @@ def build_rollout_state(
             draft_ids,
             condition,
             condition_pooled,
-            aesthetic_score=sample_aesthetic_score,
+            sample_aesthetic_score=sample_aesthetic_score,
         )
 
     annealed_temp = float(randomize_temperature) * (1.0 - ratio)
@@ -492,17 +555,14 @@ def build_rollout_state(
         logits_for_sample[..., mask_token_id] = -1e9
 
     sampled_ids = _add_gumbel_noise(logits_for_sample, annealed_temp).argmax(dim=-1)
-    sampled_logits = torch.squeeze(
-        torch.gather(logits_for_sample, dim=-1, index=torch.unsqueeze(sampled_ids, -1)),
-        -1,
+    logits_rollout, hidden_rollout, text_rollout = forward_maskgen(
+        model,
+        sampled_ids,
+        condition,
+        condition_pooled,
+        sample_aesthetic_score=sample_aesthetic_score,
     )
-
-    confidence = _add_gumbel_noise(sampled_logits, annealed_temp) if prob_sorting else sampled_logits
-    candidate_mask = build_low_score_candidate_mask(
-        confidence,
-        threshold=margin_threshold,
-    )
-    selection_scores = -confidence
+    nll_rollout = compute_token_nll(logits_rollout, gt_tokens)
 
     seq_len = int(sampled_ids.shape[1])
     schedule_mask_ratio = float(get_masking_ratio(ratio, model.mask_schedule_strategy))
@@ -511,13 +571,59 @@ def build_rollout_state(
     else:
         effective_ratio = schedule_mask_ratio
     num_to_mask = _resolve_num_selected(seq_len, effective_ratio, min_tokens=1)
+    if num_to_mask == 0:
+        return sampled_ids, timesteps
 
-    remask_idx, remask_valid = select_topk_token_positions(
-        selection_scores,
+    base_candidate_mask = sampled_ids.ne(mask_token_id)
+    if critic is not None and float(critic_policy_prob) > 0.0 and random.random() < float(critic_policy_prob):
+        critic_scores = critic(
+            hidden_states=hidden_rollout if critic_use_hidden else None,
+            logits=logits_rollout,
+            timesteps=timesteps,
+            text_features=text_rollout,
+        )
+        selection_scores = critic_scores
+        if bool(critic_selection_noise):
+            selection_scores = _add_gumbel_noise(selection_scores, annealed_temp)
+        remask_idx, remask_valid = select_topk_token_positions(
+            selection_scores,
+            num_to_mask,
+            candidate_mask=base_candidate_mask,
+            min_tokens=1,
+        )
+        z_t = remask_positions(sampled_ids, remask_idx, mask_token_id, valid_mask=remask_valid)
+        return z_t, timesteps
+
+    subset_size = max(
         num_to_mask,
-        candidate_mask=candidate_mask,
+        _resolve_num_selected(seq_len, counterfactual_sample_ratio, min_tokens=1),
+    )
+    selected_idx, selected_valid = select_token_subset(
+        base_candidate_mask,
+        subset_size,
         min_tokens=1,
     )
+    counterfactual_regrets = compute_counterfactual_regret(
+        model=model,
+        z_t=sampled_ids,
+        gt_tokens=gt_tokens,
+        condition=condition,
+        condition_pooled=condition_pooled,
+        selected_idx=selected_idx,
+        selected_valid=selected_valid,
+        sample_aesthetic_score=sample_aesthetic_score,
+        nll_orig=nll_rollout,
+        counterfactual_chunk_size=counterfactual_chunk_size,
+        neighborhood_radius=neighborhood_radius,
+    )
+    local_idx, local_valid = select_topk_token_positions(
+        counterfactual_regrets,
+        num_to_mask,
+        candidate_mask=selected_valid,
+        min_tokens=1,
+    )
+    remask_idx = selected_idx.gather(dim=-1, index=local_idx)
+    remask_valid = selected_valid.gather(dim=-1, index=local_idx) & local_valid
     z_t = remask_positions(sampled_ids, remask_idx, mask_token_id, valid_mask=remask_valid)
     return z_t, timesteps
 
@@ -542,6 +648,7 @@ def generate_wrapper(
     guidance_decay="cosine",
     guidance_decay_scale_pow=1.0,
     prob_sorting=True,
+    repair_greedy=True,
 ):
     """Generate tokens via `model.generate()` and optionally refine from a chosen start step."""
     assert guidance_decay in ["linear", "cosine", "none", "flippedcosine"]
@@ -549,6 +656,7 @@ def generate_wrapper(
     assert refine_start_step < num_sample_steps, "refine_start_step must be less than num_sample_steps"
     if bool(use_critic_head) and critic is None:
         raise ValueError("use_critic_head=True requires a non-None critic.")
+    _ = margin_threshold  # Kept for backwards compatibility; TRC remasking uses top-k critic scores.
 
 
     sample_aesthetic_score = float(
@@ -636,7 +744,10 @@ def generate_wrapper(
         if 0 <= mask_token_id < logits_for_sample.shape[-1]:
             logits_for_sample[..., mask_token_id] = -1e9
 
-        sampled_ids = _add_gumbel_noise(logits_for_sample, annealed_temp).argmax(dim=-1)
+        if bool(repair_greedy):
+            sampled_ids = logits_for_sample.argmax(dim=-1)
+        else:
+            sampled_ids = _add_gumbel_noise(logits_for_sample, annealed_temp).argmax(dim=-1)
         sampled_ids = torch.where(is_mask, sampled_ids, ids)
 
         # Final timestep keeps the sampled refinement without remasking again.
@@ -644,20 +755,12 @@ def generate_wrapper(
             ids = sampled_ids
             continue
 
-        candidate_mask = build_high_score_candidate_mask(
-            critic_scores,
-            threshold=margin_threshold,
-        )
-        candidate_mask = candidate_mask & sampled_ids.ne(mask_token_id)
-
-        # Critic predicts revision utility; remask high-score positions.
+        # Critic-guided repair uses deterministic top-k remasking at evaluation time.
         selection_scores = critic_scores
-        if prob_sorting:
-            selection_scores = _add_gumbel_noise(selection_scores, annealed_temp)
         select_idx, select_valid = select_topk_token_positions(
             selection_scores,
             remask_ratio,
-            candidate_mask=candidate_mask,
+            candidate_mask=sampled_ids.ne(mask_token_id),
         )
         ids = remask_positions(sampled_ids, select_idx, mask_token_id, valid_mask=select_valid)
 
@@ -715,6 +818,7 @@ def generate_image_vq_batch(
     critic_use_hidden=True,
     margin_threshold=0.20,
     refine_softmax_temperature=0.7,
+    repair_greedy=True,
 ):
     """Generate image batch from prompts with optional critic-based token refinement."""
     model_device = next(model.parameters()).device
@@ -741,6 +845,7 @@ def generate_image_vq_batch(
         refine_start_step=refine_start_step,
         critic_use_hidden=bool(critic_use_hidden),
         refine_softmax_temperature=refine_softmax_temperature,
+        repair_greedy=bool(repair_greedy),
     ).to(model_device)
     text_guidance = prepare_text_guidance(prompts, clip_tokenizer, clip_encoder, model_device)
     image = tokenizer.decode_tokens(tokens, text_guidance)
@@ -837,7 +942,7 @@ def main():
         stream_prefetch_batches = max(1, min(8, max(2, int(training.per_gpu_batch_size) // 64)))
 
     for _ in range(int(training.num_epochs)):
-        stream = _prefetch_batches(
+        stream = prefetch_batches(
             dataset_pipeline.iter_batches(
                 batch_size=int(training.per_gpu_batch_size),
                 rank=rank,
@@ -846,8 +951,14 @@ def main():
             prefetch_batches=stream_prefetch_batches,
         )
         for images, captions in stream:
-            gt_tokens = _images_to_tokens(tokenizer, images, int(model.image_seq_len)).to(device, non_blocking=True)
+            gt_tokens = images_to_tokens(tokenizer, images, int(model.image_seq_len)).to(device, non_blocking=True)
             train_aes = float(training.train_aesthetic_score)
+            dagger_prob = schedule_linear_value(
+                step=step,
+                start_value=float(getattr(training, "dagger_prob_start", 0.0)),
+                end_value=float(getattr(training, "dagger_prob_end", 0.0)),
+                anneal_steps=int(getattr(training, "dagger_anneal_steps", 0)),
+            )
 
             with torch.no_grad():
                 # Match inference-side text conditioning (no training-time text dropout).
@@ -855,26 +966,28 @@ def main():
                 condition = condition.to(device, non_blocking=True)
                 condition_pooled = condition_pooled.to(device, non_blocking=True)
            
-                use_rollout = random.random() < float(training.rollout_prob)
-                if use_rollout:
-                    z_t, timesteps = build_rollout_state(
-                        model=model,
-                        captions=captions,
-                        clip_tokenizer=clip_tokenizer,
-                        clip_encoder=clip_encoder,
-                        gt_tokens=gt_tokens,
-                        guidance_scale=float(training.train_guidance_scale),
-                        randomize_temperature=float(training.train_randomize_temperature),
-                        sample_aesthetic_score=float(training.train_aesthetic_score),
-                        remask_ratio=float(training.train_remask_ratio),
-                        margin_threshold=float(training.margin_threshold),
-                        num_sample_steps=int(model_cfg.sample_steps),
-                        refine_loops=int(training.refine_loops),
-                        refine_start_step=int(training.train_refine_start_step),
-                    )
-                else:
-                    timesteps = torch.rand((gt_tokens.shape[0],), device=device)
-                    z_t, _ = sample_masked_state(model, gt_tokens, timesteps)
+                z_t, timesteps = build_rollout_state(
+                    model=model,
+                    captions=captions,
+                    clip_tokenizer=clip_tokenizer,
+                    clip_encoder=clip_encoder,
+                    gt_tokens=gt_tokens,
+                    guidance_scale=float(training.train_guidance_scale),
+                    randomize_temperature=float(training.train_randomize_temperature),
+                    sample_aesthetic_score=float(training.train_aesthetic_score),
+                    remask_ratio=float(training.train_remask_ratio),
+                    margin_threshold=float(training.margin_threshold),
+                    num_sample_steps=int(model_cfg.sample_steps),
+                    refine_loops=int(training.refine_loops),
+                    refine_start_step=int(training.train_refine_start_step),
+                    counterfactual_sample_ratio=float(training.token_sample_ratio),
+                    counterfactual_chunk_size=int(training.counterfactual_chunk_size),
+                    neighborhood_radius=int(training.neighborhood_radius),
+                    critic=critic,
+                    critic_use_hidden=True,
+                    critic_policy_prob=float(dagger_prob),
+                    critic_selection_noise=bool(getattr(training, "dagger_selection_noise", False)),
+                )
 
                 logits_orig, hidden_orig, text_feat = forward_maskgen(
                     model,
@@ -891,80 +1004,71 @@ def main():
                 text_features=text_feat,
             )
             base_candidate_mask = z_t.ne(int(model.mask_token_id))
-            candidate_mask = build_mixed_training_candidate_mask(
-                critic_scores=pred.detach(),
+            selected_idx, selected_valid = select_mixed_token_subset(
+                candidate_mask=base_candidate_mask,
+                ratio_or_count=float(training.token_sample_ratio),
                 logits=logits_orig.detach(),
-                base_mask=base_candidate_mask,
-                utility_threshold=float(training.margin_threshold),
-                random_fraction=float(training.token_sample_ratio),
-            )
-            selected_idx, selected_valid = select_topk_token_positions(
-                pred.detach(),
-                remask_ratio=float(training.token_sample_ratio),
-                candidate_mask=candidate_mask,
+                critic_scores=pred.detach(),
+                random_fraction=float(getattr(training, "training_random_fraction", 0.5)),
+                low_margin_fraction=float(getattr(training, "training_low_margin_fraction", 0.25)),
+                critic_fraction=float(getattr(training, "training_critic_fraction", 0.25)),
                 min_tokens=1,
             )
 
             with torch.no_grad():
-                nll_orig = F.cross_entropy(logits_orig.transpose(1, 2), gt_tokens, reduction="none")
-                proxy_regrets = torch.zeros_like(selected_idx, dtype=logits_orig.dtype)
-                pair = torch.nonzero(selected_valid, as_tuple=False)
-                seq_len = int(gt_tokens.shape[1])
-                for start in range(0, pair.shape[0], int(training.counterfactual_chunk_size)):
-                    part = pair[start:start + int(training.counterfactual_chunk_size)]
-                    if part.numel() == 0:
-                        continue
-                    b_idx = part[:, 0]
-                    k_idx = part[:, 1]
-                    tok_idx = selected_idx[b_idx, k_idx]
-
-                    z_cf = z_t[b_idx].clone()
-                    z_cf[torch.arange(z_cf.shape[0], device=z_cf.device), tok_idx] = int(model.mask_token_id)
-                    cond_cf = condition[b_idx]
-                    pooled_cf = condition_pooled[b_idx]
-
-                    logits_cf, _, _ = forward_maskgen(
-                        model,
-                        z_cf,
-                        cond_cf,
-                        pooled_cf,
-                        sample_aesthetic_score=train_aes,
-                    )
-                    gt_cf = gt_tokens[b_idx]
-                    nll_cf_all = F.cross_entropy(logits_cf.transpose(1, 2), gt_cf, reduction="none")
-
-                    neigh_idx, neigh_valid = build_local_neighborhood_index(
-                        seq_len=seq_len,
-                        token_indices=tok_idx,
-                        radius=int(training.neighborhood_radius),
-                    )
-
-                    orig_patch = nll_orig[b_idx].gather(dim=-1, index=neigh_idx)
-                    cf_patch = nll_cf_all.gather(dim=-1, index=neigh_idx)
-                    # One-step masked counterfactual proxy (not full roll-out regret).
-                    patch_regret = (orig_patch - cf_patch) * neigh_valid.to(orig_patch.dtype)
-                    valid_count = neigh_valid.to(orig_patch.dtype).sum(dim=-1).clamp(min=1.0)
-                    proxy_regrets[b_idx, k_idx] = patch_regret.sum(dim=-1) / valid_count
-                    
-
-                # Utility sign controls orientation; +1 keeps current proxy orientation.
-                proxy_utility = proxy_regrets * float(training.utility_sign)
+                nll_orig = compute_token_nll(logits_orig, gt_tokens)
+                counterfactual_regrets = compute_counterfactual_regret(
+                    model=model,
+                    z_t=z_t,
+                    gt_tokens=gt_tokens,
+                    condition=condition,
+                    condition_pooled=condition_pooled,
+                    selected_idx=selected_idx,
+                    selected_valid=selected_valid,
+                    sample_aesthetic_score=train_aes,
+                    nll_orig=nll_orig,
+                    counterfactual_chunk_size=int(training.counterfactual_chunk_size),
+                    neighborhood_radius=int(training.neighborhood_radius),
+                )
                 targets, rank_utility = build_utility_targets(
-                    proxy_utility=proxy_utility,
+                    counterfactual_utility=counterfactual_regrets,
                     valid_mask=selected_valid,
                     transform=str(training.target_transform),
                     target_scale=float(training.target_scale),
                     target_zclip=float(training.target_zclip),
                 )
             pred_sel = pred.gather(dim=-1, index=selected_idx)
+            regret_corr = masked_pearson_corr(pred_sel.detach(), counterfactual_regrets, selected_valid)
+            visible_pred_mean = float(pred[base_candidate_mask].mean().item()) if base_candidate_mask.any() else 0.0
+            masked_pred_mean = float(pred[~base_candidate_mask].mean().item()) if (~base_candidate_mask).any() else 0.0
 
             denom = selected_valid.float().sum().clamp(min=1.0)
-            loss_reg = (((pred_sel - targets) ** 2) * selected_valid.float()).sum() / denom
-            loss_rank = pairwise_rank_loss(pred_sel, rank_utility, selected_valid, margin=float(training.rank_margin)) if bool(training.lambda_rank) > 0.0 else torch.tensor(0.0, device=pred_sel.device)
+            regression_mode = str(getattr(training, "regression_loss", "huber")).strip().lower()
+            if regression_mode == "huber":
+                loss_reg = (
+                    F.smooth_l1_loss(
+                        pred_sel,
+                        counterfactual_regrets,
+                        reduction="none",
+                        beta=float(getattr(training, "huber_beta", 0.5)),
+                    ) * selected_valid.float()
+                ).sum() / denom
+            elif regression_mode == "mse":
+                loss_reg = (((pred_sel - counterfactual_regrets) ** 2) * selected_valid.float()).sum() / denom
+            else:
+                raise ValueError(f"Unsupported regression_loss: {training.regression_loss}")
+            loss_rank = pairwise_rank_loss(pred_sel, rank_utility, selected_valid, margin=float(training.rank_margin)) if float(training.lambda_rank) > 0.0 else torch.tensor(0.0, device=pred_sel.device)
             loss = loss_reg + float(training.lambda_rank) * loss_rank
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            grad_clip_norm = float(getattr(training, "grad_clip_norm", 0.0))
+            grad_norm = torch.tensor(0.0, device=pred_sel.device)
+            if grad_clip_norm > 0.0:
+                grad_norm = torch.as_tensor(
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=grad_clip_norm),
+                    device=pred_sel.device,
+                )
             optimizer.step()
 
             step += 1
@@ -977,24 +1081,33 @@ def main():
                     "loss": float(loss.item()),
                     "reg": float(loss_reg.item()),
                     "rank": float(loss_rank.item()),
-                    "tgt_m": tgt_mean,
-                    "tgt_s": tgt_std,
+                    "corr": float(regret_corr.item()),
+                    "reg_m": float(counterfactual_regrets[keep].mean().item()) if keep.any() else 0.0,
+                    "dag": float(dagger_prob),
                 })
                 if tb_logger is not None and step % max(1, int(training.log_every)) == 0:
                     selected_count = float(selected_valid.float().sum().item())
                     selected_frac = float(selected_valid.float().mean().item()) if selected_valid.numel() > 0 else 0.0
+                    regret_mean = float(counterfactual_regrets[keep].mean().item()) if keep.any() else 0.0
+                    regret_std = float(counterfactual_regrets[keep].std(unbiased=False).item()) if keep.any() else 0.0
                     tb_logger.log_metrics(
                         step,
                         {
                             "train/loss": float(loss.item()),
                             "train/loss_reg": float(loss_reg.item()),
                             "train/loss_rank": float(loss_rank.item()),
+                            "train/regret_corr": float(regret_corr.item()),
+                            "train/regret_mean": regret_mean,
+                            "train/regret_std": regret_std,
                             "train/target_mean": tgt_mean,
                             "train/target_std": tgt_std,
+                            "train/pred_visible_mean": visible_pred_mean,
+                            "train/pred_masked_mean": masked_pred_mean,
+                            "train/dagger_prob": float(dagger_prob),
+                            "train/grad_norm": float(grad_norm.item()),
                             "train/selected_count": selected_count,
                             "train/selected_fraction": selected_frac,
                             "train/timestep_mean": float(timesteps.mean().item()),
-                            "train/use_rollout": int(use_rollout),
                         },
                     )
 

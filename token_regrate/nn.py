@@ -11,7 +11,7 @@ class TokenRegretCritic(nn.Module):
         self.use_hidden = bool(use_hidden)
         self.logits_topk = int(logits_topk)
         self.timestep_dim = int(timestep_dim)
-        in_dim = self.timestep_dim + self.logits_topk + 2 + text_dim
+        in_dim = self.timestep_dim + self.logits_topk + text_dim
         if self.use_hidden:
             in_dim += hidden_dim
         self.net = nn.Sequential(
@@ -33,16 +33,12 @@ class TokenRegretCritic(nn.Module):
         return emb
 
     def _logit_features(self, logits):
-        """Build compact uncertainty features from token logits."""
+        """Build compact generator-state features from token logits."""
         k = min(self.logits_topk, logits.shape[-1])
         topk = torch.topk(logits, k=k, dim=-1).values
         if k < self.logits_topk:
             topk = F.pad(topk, (0, self.logits_topk - k))
-        # Add uncertainty descriptors so the critic can rank tokens by edit value.
-        probs = torch.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs.clamp(min=1e-8))).sum(dim=-1, keepdim=True)
-        max_prob = probs.max(dim=-1, keepdim=True).values
-        return torch.cat([topk, entropy, max_prob], dim=-1)
+        return topk
 
     def forward(self, hidden_states, logits, timesteps, text_features):
         """Predict a scalar revision-utility score per token position."""

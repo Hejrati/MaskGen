@@ -2,7 +2,7 @@ import json
 import os
 import random
 import numpy as np
-
+from PIL import Image
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
@@ -210,3 +210,83 @@ def save_critic_checkpoint(path, critic, optimizer, step, config_dict) -> None:
     }
     torch.save(payload, path)
 
+def prefetch_batches(iterable, prefetch_batches=4):
+    """Prefetch iterable items on a background thread to overlap I/O and compute."""
+    from queue import Queue
+    from threading import Thread
+
+    prefetch_batches = max(1, int(prefetch_batches))
+    queue = Queue(maxsize=prefetch_batches)
+    sentinel = object()
+    error_box = {}
+
+    def _worker():
+        """Producer thread that fills queue and forwards exceptions."""
+        try:
+            for item in iterable:
+                queue.put(item)
+        except Exception as exc:
+            error_box["exc"] = exc
+        finally:
+            queue.put(sentinel)
+
+    thread = Thread(target=_worker, daemon=True)
+    thread.start()
+
+    while True:
+        item = queue.get()
+        if item is sentinel:
+            break
+        yield item
+
+    thread.join()
+    if "exc" in error_box:
+        raise error_box["exc"]
+    
+    
+def _tokenizer_image_size(tokenizer):
+    """Read tokenizer input size from config, falling back to 256."""
+    cfg = getattr(tokenizer, "config", None)
+    size = None
+    if cfg is not None:
+        try:
+            size = int(cfg.model.vq_model.image_size)
+        except Exception:
+            size = None
+    return size if size is not None and size > 0 else 256
+def _center_crop_arr(pil_image, image_size):
+    """Resize then center-crop a PIL image to a square size."""
+    while min(*pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
+    scale = image_size / min(*pil_image.size)
+    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
+    arr = np.array(pil_image)
+    crop_y = (arr.shape[0] - image_size) // 2
+    crop_x = (arr.shape[1] - image_size) // 2
+    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+
+
+
+def images_to_tokens(tokenizer, images, expected_seq_len):
+    """Convert PIL images into discrete tokenizer token grids."""
+    image_size = _tokenizer_image_size(tokenizer)
+    tokenizer_device = next(tokenizer.parameters()).device
+    proc = []
+    for img in images:
+        crop = _center_crop_arr(img.convert("RGB"), image_size)
+        arr = np.asarray(crop, dtype=np.float32) / 255.0
+        ten = torch.from_numpy(arr).permute(2, 0, 1)
+        proc.append(ten)
+    x = torch.stack(proc, dim=0).to(tokenizer_device, non_blocking=True)
+
+    with torch.no_grad():
+        _, result_dict = tokenizer.encode(x)
+    token_grid = result_dict["min_encoding_indices"].long()
+    tokens = token_grid.view(token_grid.shape[0], -1)
+
+    if tokens.shape[1] != int(expected_seq_len):
+        raise ValueError(
+            f"Token length mismatch: got {tokens.shape[1]}, expected {int(expected_seq_len)}. "
+            "Check tokenizer/image size compatibility with the generator."
+        )
+    return tokens
