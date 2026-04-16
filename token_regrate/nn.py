@@ -1,12 +1,14 @@
 
-import torch.nn as nn
 import math
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
 
 class TokenRegretCritic(nn.Module):
     def __init__(self, hidden_dim, text_dim, timestep_dim=32, mlp_dim=512, logits_topk=8, use_hidden=True):
-        """Construct a per-token critic that predicts revision-utility scores."""
+        """Construct a per-token critic that predicts scalar counterfactual regret."""
         super().__init__()
         self.use_hidden = bool(use_hidden)
         self.logits_topk = int(logits_topk)
@@ -41,7 +43,7 @@ class TokenRegretCritic(nn.Module):
         return topk
 
     def forward(self, hidden_states, logits, timesteps, text_features):
-        """Predict a scalar revision-utility score per token position."""
+        """Predict scalar regret per token position."""
         bsz, seq_len, _ = logits.shape
         t_feat = self._timestep_embedding(timesteps).unsqueeze(1).expand(bsz, seq_len, -1)
         logit_feat = self._logit_features(logits)

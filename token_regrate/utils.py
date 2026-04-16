@@ -174,12 +174,72 @@ def cleanup_distributed():
     if is_dist():
         dist.destroy_process_group()
 
-def load_critic_checkpoint(path, critic, optimizer=None, map_location="cpu"):
-    """Load critic (and optional optimizer) state from checkpoint file."""
+def _upgrade_scalar_critic_state_dict(state_dict, target_state_dict):
+    """Map legacy action-value critic checkpoints to the scalar-regret head."""
+    migrated = False
+    state_dict = dict(state_dict)
+    weight_key = "net.4.weight"
+    bias_key = "net.4.bias"
+    if (
+        weight_key in state_dict
+        and weight_key in target_state_dict
+        and state_dict[weight_key].shape != target_state_dict[weight_key].shape
+    ):
+        old_weight = state_dict[weight_key]
+        new_weight = torch.zeros_like(target_state_dict[weight_key])
+        old_rows = int(old_weight.shape[0])
+        new_rows = int(new_weight.shape[0])
+        copy_rows = min(old_rows, new_rows)
+        if old_rows == 1 and new_rows >= 2:
+            new_weight[1].copy_(old_weight[0])
+        elif old_rows >= 2 and new_rows == 1:
+            new_weight[0].copy_(old_weight[1] - old_weight[0])
+        else:
+            new_weight[:copy_rows].copy_(old_weight[:copy_rows])
+        state_dict[weight_key] = new_weight
+        migrated = True
+    if (
+        bias_key in state_dict
+        and bias_key in target_state_dict
+        and state_dict[bias_key].shape != target_state_dict[bias_key].shape
+    ):
+        old_bias = state_dict[bias_key]
+        new_bias = torch.zeros_like(target_state_dict[bias_key])
+        old_rows = int(old_bias.shape[0])
+        new_rows = int(new_bias.shape[0])
+        copy_rows = min(old_rows, new_rows)
+        if old_rows == 1 and new_rows >= 2:
+            new_bias[1].copy_(old_bias[0])
+        elif old_rows >= 2 and new_rows == 1:
+            new_bias[0].copy_(old_bias[1] - old_bias[0])
+        else:
+            new_bias[:copy_rows].copy_(old_bias[:copy_rows])
+        state_dict[bias_key] = new_bias
+        migrated = True
+    return state_dict, migrated
+
+
+def load_critic_checkpoint(path, critic, optimizer=None, map_location="cpu", target_critic=None):
+    """Load critic, optional optimizer, and optional EMA target critic state from checkpoint file."""
     ckpt = torch.load(path, map_location=map_location)
-    critic.load_state_dict(ckpt["critic"], strict=True)
-    if optimizer is not None and "optimizer" in ckpt:
+    critic_state, migrated_scalar_head = _upgrade_scalar_critic_state_dict(ckpt["critic"], critic.state_dict())
+    critic.load_state_dict(critic_state, strict=True)
+    if optimizer is not None and "optimizer" in ckpt and not migrated_scalar_head:
         optimizer.load_state_dict(ckpt["optimizer"])
+    target_restored = False
+    target_migrated_scalar_head = False
+    if target_critic is not None and "target_critic" in ckpt:
+        target_state, target_migrated_scalar_head = _upgrade_scalar_critic_state_dict(
+            ckpt["target_critic"],
+            target_critic.state_dict(),
+        )
+        target_critic.load_state_dict(target_state, strict=True)
+        target_critic.eval()
+        target_critic.requires_grad_(False)
+        target_restored = True
+    ckpt["critic_scalar_head_migrated"] = bool(migrated_scalar_head)
+    ckpt["target_critic_restored"] = bool(target_restored)
+    ckpt["target_critic_scalar_head_migrated"] = bool(target_migrated_scalar_head)
     return ckpt
 
 
@@ -199,15 +259,18 @@ def load_trained_critic(ckpt_path, model, use_hidden=True):
     critic.requires_grad_(False)
     return critic
 
-def save_critic_checkpoint(path, critic, optimizer, step, config_dict) -> None: 
-    """Persist critic/optimizer state and training metadata."""
+def save_critic_checkpoint(path, critic, optimizer, step, config_dict, target_critic=None) -> None:
+    """Persist critic/optimizer/EMA target state and training metadata."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "critic": critic.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": int(step),
         "config": config_dict,
+        "critic_output": "scalar_counterfactual_regret",
     }
+    if target_critic is not None:
+        payload["target_critic"] = target_critic.state_dict()
     torch.save(payload, path)
 
 def prefetch_batches(iterable, prefetch_batches=4):
@@ -244,16 +307,6 @@ def prefetch_batches(iterable, prefetch_batches=4):
         raise error_box["exc"]
     
     
-def _tokenizer_image_size(tokenizer):
-    """Read tokenizer input size from config, falling back to 256."""
-    cfg = getattr(tokenizer, "config", None)
-    size = None
-    if cfg is not None:
-        try:
-            size = int(cfg.model.vq_model.image_size)
-        except Exception:
-            size = None
-    return size if size is not None and size > 0 else 256
 def _center_crop_arr(pil_image, image_size):
     """Resize then center-crop a PIL image to a square size."""
     while min(*pil_image.size) >= 2 * image_size:
@@ -267,9 +320,11 @@ def _center_crop_arr(pil_image, image_size):
 
 
 
-def images_to_tokens(tokenizer, images, expected_seq_len):
+def images_to_tokens(tokenizer, images):
     """Convert PIL images into discrete tokenizer token grids."""
-    image_size = _tokenizer_image_size(tokenizer)
+    image_size = int(tokenizer.config.dataset.preprocessing.crop_size)
+    tokenizer_seq_len = int(tokenizer.config.model.vq_model.num_latent_tokens)
+
     tokenizer_device = next(tokenizer.parameters()).device
     proc = []
     for img in images:
@@ -284,9 +339,7 @@ def images_to_tokens(tokenizer, images, expected_seq_len):
     token_grid = result_dict["min_encoding_indices"].long()
     tokens = token_grid.view(token_grid.shape[0], -1)
 
-    if tokens.shape[1] != int(expected_seq_len):
-        raise ValueError(
-            f"Token length mismatch: got {tokens.shape[1]}, expected {int(expected_seq_len)}. "
-            "Check tokenizer/image size compatibility with the generator."
-        )
+    if tokens.shape[1] != tokenizer_seq_len:
+        raise ValueError(f"Token length mismatch: got {tokens.shape[1]}, expected {tokenizer_seq_len}")
+
     return tokens
