@@ -9,4 +9,4 @@ geneval/
 dataset
 .codex
 *.pdf
-viz.*
+viz.ipynb
