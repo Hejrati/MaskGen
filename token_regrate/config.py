@@ -20,10 +20,10 @@ def get_config():
     config.training.num_epochs = 50
     # Hard cap on optimizer steps after resume; 0 means no explicit step cap.
     config.training.max_steps = 0
-    # If >0, collect this many examples once, save them, and replay only that fixed subset.
-    config.training.max_train_images = 4
+    # If >0, collect this many examples once and replay only that fixed subset; 0 uses the full dataset stream.
+    config.training.max_train_images = 0
     # Per-process batch size; total global batch is this value times world_size.
-    config.training.per_gpu_batch_size = 4
+    config.training.per_gpu_batch_size = 64
     # AdamW learning rate for the trainable token-regret critic only; generator/tokenizer stay frozen.
     config.training.learning_rate = 2e-4
     # Number of candidate token counterfactuals evaluated per chunk to control memory use.
@@ -71,7 +71,7 @@ def get_config():
     # Number of critic-guided decision steps after train_refine_start_step.
     config.training.refine_loops = 5
     # Save critic_step_N.pt and critic_last.pt every this many optimizer steps on rank 0.
-    config.training.save_every = 10
+    config.training.save_every = 1
     # Log metrics every this many optimizer steps on rank 0.
     config.training.log_every = 1
 
