@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import os
 import sys
@@ -932,6 +933,7 @@ def build_rollout_state(
     critic=None,
     remask_ratio=0.05,
     critic_use_hidden=True,
+    fixed_step=None,
 ):
     """
      creates a realistic partially denoised MaskGen token sequence at a randomly chosen refinement timestep, 
@@ -949,8 +951,11 @@ def build_rollout_state(
     
     decision_loop_count = _resolve_refine_loop_count(refine_loops, refine_start_step, num_sample_steps)
     refine_end_step = int(refine_start_step) + decision_loop_count
-    loop_idx = int(torch.randint(0, decision_loop_count, (1,), device=device).item())
-    step = int(refine_start_step) + loop_idx
+    if fixed_step is None or int(fixed_step) < 0:
+        loop_idx = int(torch.randint(0, decision_loop_count, (1,), device=device).item())
+        step = int(refine_start_step) + loop_idx
+    else:
+        step = max(int(refine_start_step), min(int(fixed_step), int(refine_end_step) - 1))
     ratio = float(step + 1) / float(num_sample_steps)
     timesteps = torch.full((batch_size,), ratio, device=device)
     step_indices = torch.full((batch_size,), step, dtype=torch.long, device=device)
@@ -1182,11 +1187,101 @@ def generate_image_vq_batch(
     image = (image * 255.0).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
     return [Image.fromarray(arr) for arr in image]
 
+def _collect_fixed_training_subset(dataset_pipeline, count, rank, world_size):
+    """Collect a deterministic local subset from the configured training stream."""
+    images = []
+    captions = []
+    target_count = max(0, int(count))
+    if target_count <= 0:
+        return images, captions
+
+    for batch_images, batch_captions in dataset_pipeline.iter_batches(
+        batch_size=target_count,
+        rank=rank,
+        world_size=world_size,
+    ):
+        remaining = target_count - len(captions)
+        if remaining <= 0:
+            break
+        images.extend(batch_images[:remaining])
+        captions.extend(batch_captions[:remaining])
+        if len(captions) >= target_count:
+            break
+
+    if len(captions) < target_count:
+        raise RuntimeError(
+            f"Requested {target_count} training images on rank {rank}, "
+            f"but the dataset yielded only {len(captions)} usable examples."
+        )
+    return images, captions
+
+
+def _iter_fixed_subset_batches(images, captions, batch_size):
+    """Yield batches from an in-memory fixed subset."""
+    batch_size = max(1, int(batch_size))
+    for start in range(0, len(captions), batch_size):
+        end = start + batch_size
+        yield images[start:end], captions[start:end]
+
+
+def _save_fixed_training_subset(output_dir, images, captions, rank, world_size):
+    """Save fixed training subset images and captions for later notebook inspection."""
+    subset_dir = os.path.join(output_dir, "used_training_images")
+    rank_dir = os.path.join(subset_dir, f"rank_{int(rank):04d}")
+    os.makedirs(rank_dir, exist_ok=True)
+
+    rank_manifest_path = os.path.join(subset_dir, f"rank_{int(rank):04d}.jsonl")
+    rows = []
+    for local_idx, (image, caption) in enumerate(zip(images, captions)):
+        image_name = f"sample_{int(local_idx):05d}.png"
+        rel_image = os.path.join(f"rank_{int(rank):04d}", image_name)
+        image.save(os.path.join(subset_dir, rel_image))
+        rows.append(
+            {
+                "rank": int(rank),
+                "world_size": int(world_size),
+                "local_index": int(local_idx),
+                "global_index": int(rank) + int(local_idx) * max(1, int(world_size)),
+                "image": rel_image,
+                "caption": str(caption),
+            }
+        )
+
+    with open(rank_manifest_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+
+    return subset_dir, rank_manifest_path
+
+
+def _merge_fixed_training_subset_manifests(output_dir, world_size):
+    """Merge per-rank subset manifests into one stable manifest for notebook use."""
+    subset_dir = os.path.join(output_dir, "used_training_images")
+    rows = []
+    for rank_idx in range(max(1, int(world_size))):
+        rank_manifest_path = os.path.join(subset_dir, f"rank_{int(rank_idx):04d}.jsonl")
+        if not os.path.isfile(rank_manifest_path):
+            continue
+        with open(rank_manifest_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+
+    rows.sort(key=lambda row: (int(row.get("global_index", 0)), int(row.get("rank", 0)), int(row.get("local_index", 0))))
+    merged_manifest_path = os.path.join(subset_dir, "manifest.jsonl")
+    with open(merged_manifest_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    return merged_manifest_path, len(rows)
+
 
 def apply_cli_overrides(config):
     """Apply notebook/script command-line overrides to the default ConfigDict."""
     parser = argparse.ArgumentParser(description="Train the token-regret critic.", add_help=True)
     parser.add_argument("--num-epochs", type=int)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--max-train-images", type=int)
     parser.add_argument("--per-gpu-batch-size", type=int)
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--counterfactual-chunk-size", type=int)
@@ -1202,6 +1297,21 @@ def apply_cli_overrides(config):
     )
     parser.add_argument("--regret-target-transform", type=str)
     parser.add_argument("--target-critic-ema-decay", type=float)
+    parser.add_argument("--fixed-rollout-step", type=int)
+    parser.add_argument("--use-target-critic-replay", action="store_true", default=None)
+    parser.add_argument(
+        "--no-target-critic-replay",
+        action="store_false",
+        dest="use_target_critic_replay",
+        default=None,
+    )
+    parser.add_argument("--train-repair-greedy", action="store_true", default=None)
+    parser.add_argument(
+        "--no-train-repair-greedy",
+        action="store_false",
+        dest="train_repair_greedy",
+        default=None,
+    )
     parser.add_argument("--lambda-rank", type=float)
     parser.add_argument("--rank-margin", type=float)
     parser.add_argument("--rank-gap-threshold", type=float)
@@ -1232,6 +1342,8 @@ def apply_cli_overrides(config):
 
     assignments = [
         (training, "num_epochs", args.num_epochs),
+        (training, "max_steps", args.max_steps),
+        (training, "max_train_images", args.max_train_images),
         (training, "per_gpu_batch_size", args.per_gpu_batch_size),
         (training, "learning_rate", args.learning_rate),
         (training, "counterfactual_chunk_size", args.counterfactual_chunk_size),
@@ -1241,6 +1353,9 @@ def apply_cli_overrides(config):
         (training, "counterfactual_repair_greedy", args.counterfactual_repair_greedy),
         (training, "regret_target_transform", args.regret_target_transform),
         (training, "target_critic_ema_decay", args.target_critic_ema_decay),
+        (training, "fixed_rollout_step", args.fixed_rollout_step),
+        (training, "use_target_critic_replay", args.use_target_critic_replay),
+        (training, "train_repair_greedy", args.train_repair_greedy),
         (training, "lambda_rank", args.lambda_rank),
         (training, "rank_margin", args.rank_margin),
         (training, "rank_gap_threshold", args.rank_gap_threshold),
@@ -1380,12 +1495,74 @@ def main():
         steps_per_epoch = max(1, math.ceil(int(dataset_examples) / (int(training.per_gpu_batch_size) * max(world_size, 1))))
 
     total_steps = None if steps_per_epoch is None else int(steps_per_epoch) * int(training.num_epochs)
+    max_steps = int(getattr(training, "max_steps", 0))
+    stop_step = int(start_step) + max_steps if max_steps > 0 else None
+    if stop_step is not None:
+        total_steps = stop_step
+    max_train_images = max(0, int(getattr(training, "max_train_images", 0)))
+    max_train_images_per_rank = 0
+    fixed_subset_images = None
+    fixed_subset_captions = None
+    if max_train_images > 0:
+        max_train_images_per_rank = max(1, int(math.ceil(max_train_images / max(1, world_size))))
+        effective_max_train_images = max_train_images_per_rank * max(1, world_size)
+        subset_steps_per_epoch = max(
+            1,
+            int(math.ceil(max_train_images_per_rank / max(1, int(training.per_gpu_batch_size)))),
+        )
+        subset_total_steps = int(start_step) + subset_steps_per_epoch * int(training.num_epochs)
+        total_steps = subset_total_steps if stop_step is None else min(stop_step, subset_total_steps)
+        if is_main_process():
+            if effective_max_train_images == max_train_images:
+                print(
+                    f"Fixed training subset: {max_train_images} total "
+                    f"({max_train_images_per_rank} per rank), replayed for {int(training.num_epochs)} epochs"
+                )
+            else:
+                print(
+                    "Fixed training subset: "
+                    f"requested {max_train_images}, using {effective_max_train_images} total "
+                    f"({max_train_images_per_rank} per rank) so DDP ranks stay synchronized, "
+                    f"replayed for {int(training.num_epochs)} epochs"
+                )
+
+    os.makedirs(experiment_cfg.output_dir, exist_ok=True)
+    if max_train_images > 0:
+        fixed_subset_images, fixed_subset_captions = _collect_fixed_training_subset(
+            dataset_pipeline=dataset_pipeline,
+            count=max_train_images_per_rank,
+            rank=rank,
+            world_size=world_size,
+        )
+        subset_dir, _ = _save_fixed_training_subset(
+            output_dir=experiment_cfg.output_dir,
+            images=fixed_subset_images,
+            captions=fixed_subset_captions,
+            rank=rank,
+            world_size=world_size,
+        )
+        if is_dist():
+            dist.barrier()
+        if is_main_process():
+            merged_manifest_path, merged_count = _merge_fixed_training_subset_manifests(
+                output_dir=experiment_cfg.output_dir,
+                world_size=world_size,
+            )
+            print(f"Saved {merged_count} fixed training examples to {subset_dir}")
+            print(f"Fixed training subset manifest: {merged_manifest_path}")
+        if is_dist():
+            dist.barrier()
 
     pbar = tqdm(total=total_steps, initial=start_step, desc="iterations", unit="iter", disable=not is_main_process())
     step = int(start_step)
 
-    os.makedirs(experiment_cfg.output_dir, exist_ok=True)
     cfg = config.to_dict()
+    train_repair_greedy = bool(
+        getattr(training, "train_repair_greedy", getattr(training, "counterfactual_repair_greedy", config.inference.repair_greedy))
+    )
+    use_target_critic_replay = bool(getattr(training, "use_target_critic_replay", True))
+    fixed_rollout_step = int(getattr(training, "fixed_rollout_step", -1))
+    fixed_rollout_step_arg = fixed_rollout_step if fixed_rollout_step >= 0 else None
     tb_logger = None
     if is_main_process() and bool(logging_cfg.enabled):
         tb_logger = TensorboardLogger(log_dir=experiment_cfg.output_dir, run_name="logs", enabled=True)
@@ -1398,16 +1575,28 @@ def main():
         stream_prefetch_batches = max(1, min(8, max(2, int(training.per_gpu_batch_size) // 64)))
 
     for _ in range(int(training.num_epochs)):
-        stream = prefetch_batches(
-            dataset_pipeline.iter_batches(
+        if max_train_images > 0:
+            stream = _iter_fixed_subset_batches(
+                fixed_subset_images,
+                fixed_subset_captions,
+                batch_size=int(training.per_gpu_batch_size),
+            )
+        else:
+            batch_iter = dataset_pipeline.iter_batches(
                 batch_size=int(training.per_gpu_batch_size),
                 rank=rank,
                 world_size=world_size,
-            ),
-            prefetch_batches=stream_prefetch_batches,
-        )
+            )
+            stream = prefetch_batches(
+                batch_iter,
+                prefetch_batches=stream_prefetch_batches,
+            )
         for images, captions in stream:
+            if stop_step is not None and step >= stop_step:
+                break
             batch_size = len(captions)
+            if batch_size <= 0:
+                continue
             gt_tokens = images_to_tokens(tokenizer, images).to(device, non_blocking=True)
             train_aes = float(training.train_aesthetic_score)
 
@@ -1436,11 +1625,13 @@ def main():
                     refine_softmax_temperature=0.7,
                     refine_loops=int(training.refine_loops),
                     refine_start_step=int(training.train_refine_start_step),
-                    repair_greedy=bool(config.inference.repair_greedy),
-                    # Replay uses the frozen EMA policy, so the train critic does not generate its own targets.
-                    critic=target_critic,
+                    repair_greedy=train_repair_greedy,
+                    # For normal policy training, replay uses the frozen EMA policy. For overfit sanity
+                    # checks, disable this so the same images produce stable state distributions.
+                    critic=target_critic if use_target_critic_replay else None,
                     remask_ratio=float(training.train_remask_ratio),
                     critic_use_hidden=True,
+                    fixed_step=fixed_rollout_step_arg,
                 )
 
                 # Compute the original logits, which will be used as a baseline for the counterfactual regret
@@ -1536,12 +1727,14 @@ def main():
                 keep = selected_valid
                 pred_regret_log = pred_regret.detach()
                 pred_sel_log = pred_sel.detach()
+                targets_log = targets.detach()
                 diag_k = _resolve_schedule_remask_count(
                     model,
                     timesteps,
                     budget_fraction=float(training.train_remask_ratio),
                 )
                 regret_corr = masked_pearson_corr(pred_sel_log, counterfactual_regrets, selected_valid)
+                target_corr = masked_pearson_corr(pred_sel_log, targets_log, selected_valid)
                 visible_pred_mean = float(pred_regret_log[base_candidate_mask].mean().item()) if base_candidate_mask.any() else 0.0
                 masked_pred_mean = float(pred_regret_log[~base_candidate_mask].mean().item()) if (~base_candidate_mask).any() else 0.0
                 regret_positive_fraction = float(counterfactual_regrets[keep].gt(0.0).float().mean().item()) if keep.any() else 0.0
@@ -1566,12 +1759,18 @@ def main():
                 )
                 oracle_true = counterfactual_regrets.gather(dim=-1, index=oracle_idx)
                 oracle_true_mean = float(oracle_true[oracle_valid].mean().item()) if oracle_valid.any() else 0.0
-                tgt_mean = float(targets[keep].mean().item()) if keep.any() else 0.0
-                tgt_std = float(targets[keep].std(unbiased=False).item()) if keep.any() else 0.0
+                tgt_mean = float(targets_log[keep].mean().item()) if keep.any() else 0.0
+                tgt_std = float(targets_log[keep].std(unbiased=False).item()) if keep.any() else 0.0
+                constant_target_mse = (
+                    float(((targets_log - tgt_mean).pow(2) * valid_float).sum().item() / valid_float.sum().clamp(min=1.0).item())
+                    if keep.any()
+                    else 0.0
+                )
                 pbar.set_postfix({
                     "loss": float(loss.item()),
                     "rank": float(loss_rank.item()),
                     "corr": float(regret_corr.item()),
+                    "t_corr": float(target_corr.item()),
                     "pos_r": regret_positive_fraction,
                     "top_r": top_pred_true_mean,
                     "reg_m": float(counterfactual_regrets[keep].mean().item()) if keep.any() else 0.0,
@@ -1591,6 +1790,8 @@ def main():
                             "train/rank_margin": training.rank_margin,
                             "train/rank_gap_threshold": training.rank_gap_threshold,
                             "train/regret_corr": float(regret_corr.item()),
+                            "train/target_corr": float(target_corr.item()),
+                            "train/constant_target_mse": constant_target_mse,
                             "train/regret_mean": regret_mean,
                             "train/regret_std": regret_std,
                             "train/target_mean": tgt_mean,
@@ -1605,6 +1806,10 @@ def main():
                             "train/pred_visible_mean": visible_pred_mean,
                             "train/pred_masked_mean": masked_pred_mean,
                             "train/target_critic_ema_decay": target_ema_decay,
+                            "train/use_target_critic_replay": int(use_target_critic_replay),
+                            "train/fixed_rollout_step": fixed_rollout_step,
+                            "train/train_repair_greedy": int(train_repair_greedy),
+                            "train/train_randomize_temperature": float(training.train_randomize_temperature),
                             "train/counterfactual_rollout_steps": int(getattr(training, "counterfactual_rollout_steps", 1)),
                             "train/counterfactual_window_radius": int(getattr(training, "counterfactual_window_radius", 0)),
                             "train/counterfactual_repair_greedy": int(bool(getattr(training, "counterfactual_repair_greedy", False))),
@@ -1623,6 +1828,8 @@ def main():
                 if tb_logger is not None:
                     tb_logger.log_text("checkpoint/step", ckpt_step_path, step=step)
                     tb_logger.log_text("checkpoint/last", ckpt_last_path, step=step)
+        if stop_step is not None and step >= stop_step:
+            break
     if use_ddp:
         dist.barrier()
 

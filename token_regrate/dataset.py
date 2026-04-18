@@ -1,4 +1,5 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import csv
 import hashlib
 import io
 import json
@@ -40,6 +41,90 @@ def _looks_like_cc12m_manifest(source):
     if source is None:
         return False
     return str(source).strip().lower().endswith((".tsv", ".csv"))
+
+
+def _resolve_local_image_path(path, manifest_dir):
+    """Resolve an image path from a local manifest."""
+    path = str(path).strip()
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return path
+    candidate = os.path.join(manifest_dir, path)
+    if os.path.isfile(candidate):
+        return candidate
+    return os.path.abspath(path)
+
+
+def _iter_local_manifest_rows(manifest_path):
+    """Yield `(image_path, caption)` rows from a local TSV/CSV/JSONL manifest."""
+    manifest_path = os.path.abspath(str(manifest_path))
+    manifest_dir = os.path.dirname(manifest_path)
+    ext = os.path.splitext(manifest_path)[1].lower()
+
+    if ext == ".jsonl":
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                image_path = row.get("image") or row.get("image_path") or row.get("path") or row.get("file")
+                caption = row.get("caption") or row.get("text") or row.get("prompt")
+                if image_path and caption:
+                    yield _resolve_local_image_path(image_path, manifest_dir), str(caption).strip()
+        return
+
+    delimiter = "\t" if ext == ".tsv" else ","
+    with open(manifest_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f, delimiter=delimiter)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            image_path = str(row[0]).strip()
+            caption = delimiter.join(row[1:]).strip() if delimiter == "\t" else str(row[1]).strip()
+            if image_path and caption:
+                yield _resolve_local_image_path(image_path, manifest_dir), caption
+
+
+def _count_local_manifest_rows(manifest_path):
+    """Count valid local manifest rows."""
+    total = 0
+    for image_path, caption in _iter_local_manifest_rows(manifest_path):
+        if image_path and caption:
+            total += 1
+    return total
+
+
+def _iter_local_manifest_batches(manifest_path, batch_size, rank=0, world_size=1):
+    """Yield local image/caption batches from a path-caption manifest."""
+    batch_images = []
+    batch_captions = []
+    rank = int(rank)
+    world_size = max(1, int(world_size))
+
+    for row_idx, (image_path, caption) in enumerate(_iter_local_manifest_rows(manifest_path)):
+        if world_size > 1 and (row_idx % world_size) != rank:
+            continue
+        if not os.path.isfile(image_path):
+            continue
+        try:
+            with Image.open(image_path) as img:
+                image = img.convert("RGB")
+        except Exception:
+            continue
+        batch_images.append(image)
+        batch_captions.append(caption)
+        if len(batch_images) >= int(batch_size):
+            out = (batch_images, batch_captions)
+            batch_images, batch_captions = [], []
+            yield out
+
+    if len(batch_images) > 0:
+        yield batch_images, batch_captions
 
 
 def _normalize_train_data_sources(sources):
@@ -354,11 +439,29 @@ class TrainingDatasetPipeline:
         cc12m_max_pending=0,
     ):
         self.mode = str(mode).strip().lower() or "auto"
-        valid_modes = {"auto", "hf", "cc12m", "all"}
+        valid_modes = {"auto", "hf", "cc12m", "all", "local"}
         if self.mode not in valid_modes:
             raise ValueError(f"Unsupported dataset mode {self.mode!r}. Expected one of {sorted(valid_modes)}")
 
         self.original_sources = _normalize_train_data_sources(sources)
+        self.use_local = self.mode == "local"
+        self.local_manifest = None
+        if self.use_local:
+            if len(self.original_sources) != 1:
+                raise ValueError("Local dataset mode expects exactly one manifest path in sources.")
+            self.local_manifest = os.path.abspath(self.original_sources[0])
+            if not os.path.isfile(self.local_manifest):
+                raise FileNotFoundError(f"Local manifest file not found: {self.local_manifest}")
+            self.use_cc12m = False
+            self.use_hf = False
+            self.cc12m_tsv = None
+            self.hf_urls = []
+            self.cc12m_cache_enabled = False
+            self.cc12m_cache_dir = None
+            self.cc12m_loader_workers = max(1, int(cc12m_loader_workers))
+            self.cc12m_max_pending = max(0, int(cc12m_max_pending))
+            return
+
         split_sources = _split_train_data_sources(self.original_sources)
         parsed_cc12m_tsv = split_sources["cc12m_tsv"]
         parsed_hf_urls = split_sources["hf_urls"]
@@ -408,6 +511,8 @@ class TrainingDatasetPipeline:
     def describe(self):
         """Build a concise human-readable dataset summary for logs."""
         parts = [f"mode={self.mode}"]
+        if self.use_local:
+            parts.append(f"local={self.local_manifest}")
         if self.use_cc12m:
             parts.append(f"cc12m={self.cc12m_tsv}")
         if self.use_hf:
@@ -418,6 +523,9 @@ class TrainingDatasetPipeline:
         """Infer total examples when all selected data sources have known sizes."""
         total = 0
         has_any = False
+
+        if self.use_local:
+            return int(_count_local_manifest_rows(self.local_manifest))
 
         if self.use_cc12m:
             try:
@@ -437,6 +545,14 @@ class TrainingDatasetPipeline:
 
     def iter_batches(self, batch_size, rank=0, world_size=1):
         """Yield `(images, captions)` batches from selected dataset sources."""
+        if self.use_local:
+            yield from _iter_local_manifest_batches(
+                manifest_path=self.local_manifest,
+                batch_size=batch_size,
+                rank=rank,
+                world_size=world_size,
+            )
+
         if self.use_cc12m:
             yield from _iter_cc12m_tsv_batches_parallel(
                 tsv_path=self.cc12m_tsv,
