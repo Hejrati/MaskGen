@@ -1,4 +1,8 @@
 from ml_collections import config_dict
+import os
+
+# Unified output directory for this config module.
+OUTPUT_DIR = "outputs/token_regret_critic_overfit4"
 
 
 def get_config():
@@ -9,9 +13,9 @@ def get_config():
     # Human-readable run label stored in configs/checkpoints; paths below do not derive from it.
     config.experiment.name = "token_regret_critic"
     # Root directory for critic checkpoints, fixed training subset manifests, and run artifacts.
-    config.experiment.output_dir = "outputs/token_regret_critic_overfit4"
+    config.experiment.output_dir = OUTPUT_DIR
     # Conventional log directory under output_dir; --output-dir rewrites this path.
-    config.experiment.logging_dir = "outputs/token_regret_critic_overfit4/logs"
+    config.experiment.logging_dir = os.path.join(OUTPUT_DIR, "logs")
 
     config.training = config_dict.ConfigDict()
     # Base random seed; each DDP rank uses seed + rank for deterministic-but-distinct streams.
@@ -30,12 +34,20 @@ def get_config():
     config.training.counterfactual_chunk_size = 512
     # Number of plain MaskGen denoise steps rolled forward after each token-remask counterfactual.
     config.training.counterfactual_rollout_steps = -1
-    # Utility used to score baseline-vs-counterfactual quality; "token_ce" uses GT-token NLL.
-    config.training.counterfactual_utility = "token_ce"
-    # Extra neighboring token radius included around the tested token when reducing utility; 0 = token only.
+    # Utility used to score baseline-vs-counterfactual quality; supports CE, cond-vs-uncond, and matched-vs-mismatched prompt variants.
+    config.training.counterfactual_utility = "local_window_contrast"
+    # Extra neighboring token radius included around the tested token for local-window utilities; 0 = token only.
     config.training.counterfactual_window_radius = 6
+    # Number of mismatched batch prompts used by contrastive utilities; <=0 uses every available local-batch negative.
+    config.training.counterfactual_contrast_negatives = 2
+    # Temperature for InfoNCE-style contrastive prompt utility.
+    config.training.counterfactual_contrast_temperature = 1.0
+    # Contrastive utility reduction: "nce" uses log p(correct prompt), "neg_logsumexp" excludes the positive from the denominator.
+    config.training.counterfactual_contrast_mode = "nce"
     # Use argmax instead of Gumbel sampling inside counterfactual rollouts.
     config.training.counterfactual_repair_greedy = True
+    # Number of top cond-minus-uncond logit-gap features exposed to the regret critic; 0 disables them.
+    config.training.critic_prompt_gap_topk = 8
     # Transform raw counterfactual regret targets before MSE; supported: "none"/"tanh"/"zscore".
     config.training.regret_target_transform = "tanh"
     # Notebook/control flag for DDP-only workflows; the training entrypoint does not currently branch on it.
@@ -84,6 +96,8 @@ def get_config():
     config.inference.remask_ratio = config.training.train_remask_ratio
     # Inference-time first critic-guided step; defaults to the training start step.
     config.inference.refine_start_step = config.training.train_refine_start_step
+    # Minimum predicted regret required for critic remasking; 0 means only predicted-positive gains reopen.
+    config.inference.remask_min_score = 0.0
     # Use argmax instead of stochastic sampling during inference/evaluation generation.
     config.inference.repair_greedy = True
 
@@ -121,13 +135,13 @@ def get_config():
     # Enable TensorBoard and JSONL metric writing on rank 0.
     config.logging.enabled = True
     # Intended TensorBoard directory; --output-dir rewrites it, while TensorboardLogger currently derives it from output_dir/logs/tb.
-    config.logging.tensorboard_dir = "outputs/token_regret_critic_overfit4/logs/tb"
+    config.logging.tensorboard_dir = os.path.join(OUTPUT_DIR, "logs", "tb")
     # Intended JSONL metrics path; --output-dir rewrites it, while TensorboardLogger currently writes output_dir/logs/metrics.jsonl.
-    config.logging.metrics_path = "outputs/token_regret_critic_overfit4/logs/metrics.jsonl"
+    config.logging.metrics_path = os.path.join(OUTPUT_DIR, "logs", "metrics.jsonl")
 
     config.runtime = config_dict.ConfigDict()
     # Checkpoint to resume critic/optimizer/EMA target from; missing files only warn and start fresh.
-    config.runtime.resume_checkpoint = "outputs/token_regret_critic_overfit4/critic_last.pt"
+    config.runtime.resume_checkpoint = os.path.join(OUTPUT_DIR, "critic_last.pt")
     # Filled by setup_training_runtime from torch.distributed world size.
     config.runtime.world_size = 1
     # Filled by setup_training_runtime; True only when world_size > 1 and CUDA is available.

@@ -178,6 +178,19 @@ def _upgrade_scalar_critic_state_dict(state_dict, target_state_dict):
     """Map legacy action-value critic checkpoints to the scalar-regret head."""
     migrated = False
     state_dict = dict(state_dict)
+    input_weight_key = "net.0.weight"
+    if (
+        input_weight_key in state_dict
+        and input_weight_key in target_state_dict
+        and state_dict[input_weight_key].shape != target_state_dict[input_weight_key].shape
+    ):
+        old_weight = state_dict[input_weight_key]
+        new_weight = torch.zeros_like(target_state_dict[input_weight_key])
+        copy_rows = min(int(old_weight.shape[0]), int(new_weight.shape[0]))
+        copy_cols = min(int(old_weight.shape[1]), int(new_weight.shape[1]))
+        new_weight[:copy_rows, :copy_cols].copy_(old_weight[:copy_rows, :copy_cols])
+        state_dict[input_weight_key] = new_weight
+        migrated = True
     weight_key = "net.4.weight"
     bias_key = "net.4.bias"
     if (
@@ -243,17 +256,26 @@ def load_critic_checkpoint(path, critic, optimizer=None, map_location="cpu", tar
     return ckpt
 
 
-def build_token_regret_critic(model, use_hidden=True):
+def build_token_regret_critic(model, use_hidden=True, prompt_gap_topk=8):
     """Construct a TokenRegretCritic using generator embedding dimensions."""
     hidden_dim = int(model.pos_embed.shape[-1])
     text_dim = int(model.pos_embed.shape[-1])
-    return TokenRegretCritic(hidden_dim=hidden_dim, text_dim=text_dim, use_hidden=bool(use_hidden))
+    return TokenRegretCritic(
+        hidden_dim=hidden_dim,
+        text_dim=text_dim,
+        use_hidden=bool(use_hidden),
+        prompt_gap_topk=max(0, int(prompt_gap_topk)),
+    )
 
 
-def load_trained_critic(ckpt_path, model, use_hidden=True):
+def load_trained_critic(ckpt_path, model, use_hidden=True, prompt_gap_topk=8):
     """Build and load a frozen critic module on the model device."""
     target_device = next(model.parameters()).device
-    critic = build_token_regret_critic(model, use_hidden=use_hidden).to(target_device)
+    critic = build_token_regret_critic(
+        model,
+        use_hidden=use_hidden,
+        prompt_gap_topk=max(0, int(prompt_gap_topk)),
+    ).to(target_device)
     _ = load_critic_checkpoint(ckpt_path, critic, optimizer=None, map_location=target_device)
     critic.eval()
     critic.requires_grad_(False)

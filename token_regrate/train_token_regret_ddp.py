@@ -40,6 +40,7 @@ def forward_maskgen(
     guidance_decay_scale_pow=1.0,
     none_condition=None,
     none_condition_pooled=None,
+    return_cfg_parts=False,
 ):
     """Forward MaskGen and optionally apply the same CFG logits used during sampling."""
 
@@ -83,9 +84,14 @@ def forward_maskgen(
             )
             cond_logits, uncond_logits = logits_all[:num_samples], logits_all[num_samples:]
             logits = cond_logits + (cond_logits - uncond_logits) * cfg_scale
+            if bool(return_cfg_parts):
+                return logits, hidden_all[:num_samples], text_all[:num_samples], cond_logits, uncond_logits
             return logits, hidden_all[:num_samples], text_all[:num_samples]
 
-    return _forward_once(input_ids, condition, condition_pooled)
+    logits, hidden, text_feat = _forward_once(input_ids, condition, condition_pooled)
+    if bool(return_cfg_parts):
+        return logits, hidden, text_feat, logits, None
+    return logits, hidden, text_feat
 
 
 def select_all_token_positions(candidate_mask):
@@ -163,7 +169,7 @@ def _add_gumbel_noise(logits, temperature):
 
 @torch.no_grad()
 def compute_token_nll(logits, gt_tokens):
-    """Compute token-level NLL against ground-truth image tokens."""
+    """Compute token-level NLL against target image tokens."""
     return F.cross_entropy(logits.transpose(1, 2), gt_tokens, reduction="none")
 
 
@@ -187,37 +193,506 @@ def _canonical_counterfactual_utility(name):
         "neighborhood": "local_window_ce",
         "neighborhood_ce": "local_window_ce",
         "local_window_ce": "local_window_ce",
+        "prompt": "local_window_prompt",
+        "prompt_utility": "local_window_prompt",
+        "prompt_token": "token_prompt",
+        "prompt_token_utility": "token_prompt",
+        "token_prompt": "token_prompt",
+        "token_prompt_utility": "token_prompt",
+        "prompt_local": "local_window_prompt",
+        "prompt_local_utility": "local_window_prompt",
+        "prompt_local_window": "local_window_prompt",
+        "prompt_local_window_utility": "local_window_prompt",
+        "local_prompt": "local_window_prompt",
+        "local_prompt_utility": "local_window_prompt",
+        "local_window_prompt": "local_window_prompt",
+        "local_window_prompt_utility": "local_window_prompt",
+        "prompt_full": "full_sequence_prompt",
+        "prompt_full_utility": "full_sequence_prompt",
+        "prompt_sequence": "full_sequence_prompt",
+        "prompt_sequence_utility": "full_sequence_prompt",
+        "prompt_full_sequence": "full_sequence_prompt",
+        "prompt_full_sequence_utility": "full_sequence_prompt",
+        "full_prompt": "full_sequence_prompt",
+        "full_prompt_utility": "full_sequence_prompt",
+        "full_sequence_prompt": "full_sequence_prompt",
+        "full_sequence_prompt_utility": "full_sequence_prompt",
+        "contrast": "local_window_contrast",
+        "contrast_utility": "local_window_contrast",
+        "prompt_contrast": "local_window_contrast",
+        "prompt_contrast_utility": "local_window_contrast",
+        "nce": "local_window_contrast",
+        "prompt_nce": "local_window_contrast",
+        "token_contrast": "token_contrast",
+        "token_nce": "token_contrast",
+        "prompt_token_contrast": "token_contrast",
+        "local_contrast": "local_window_contrast",
+        "local_nce": "local_window_contrast",
+        "window_contrast": "local_window_contrast",
+        "window_nce": "local_window_contrast",
+        "local_window_contrast": "local_window_contrast",
+        "local_window_nce": "local_window_contrast",
+        "prompt_local_contrast": "local_window_contrast",
+        "prompt_local_window_contrast": "local_window_contrast",
+        "full_contrast": "full_sequence_contrast",
+        "full_nce": "full_sequence_contrast",
+        "sequence_contrast": "full_sequence_contrast",
+        "sequence_nce": "full_sequence_contrast",
+        "full_sequence_contrast": "full_sequence_contrast",
+        "full_sequence_nce": "full_sequence_contrast",
+        "prompt_full_contrast": "full_sequence_contrast",
+        "prompt_full_sequence_contrast": "full_sequence_contrast",
     }
     if name not in aliases:
         raise ValueError(
             f"Unsupported counterfactual_utility={name!r}. "
-            "Expected token_ce, local_window_ce, or full_sequence_ce."
+            "Expected token_ce, local_window_ce, full_sequence_ce, "
+            "token_prompt, local_window_prompt, full_sequence_prompt, "
+            "token_contrast, local_window_contrast, or full_sequence_contrast."
         )
     return aliases[name]
 
 
-def _reduce_counterfactual_utility(token_nll, selected_idx, counterfactual_utility, window_radius=0):
-    """Reduce token NLL to the utility attached to each selected intervention."""
+def _counterfactual_utility_family(counterfactual_utility):
+    """Return the scoring family used by a canonical counterfactual utility."""
     utility = _canonical_counterfactual_utility(counterfactual_utility)
-    if utility == "full_sequence_ce":
-        return token_nll.mean(dim=-1, keepdim=True).expand_as(selected_idx)
-    if utility == "token_ce":
-        return token_nll.gather(dim=-1, index=selected_idx)
+    if utility.endswith("_prompt"):
+        return "prompt"
+    if utility.endswith("_contrast"):
+        return "contrast"
+    return "ce"
+
+
+def _counterfactual_utility_reduction(counterfactual_utility):
+    """Return the token aggregation style used by a canonical counterfactual utility."""
+    utility = _canonical_counterfactual_utility(counterfactual_utility)
+    if utility.startswith("full_sequence_"):
+        return "full_sequence"
+    if utility.startswith("local_window_"):
+        return "local_window"
+    return "token"
+
+
+def _reduce_counterfactual_utility(token_values, selected_idx, counterfactual_utility, window_radius=0, value_mask=None):
+    """Reduce per-token utility values to the scalar attached to each selected intervention."""
+    reduction = _counterfactual_utility_reduction(counterfactual_utility)
+    if value_mask is None:
+        weights = torch.ones_like(token_values, dtype=token_values.dtype)
+    else:
+        weights = value_mask.to(dtype=token_values.dtype)
+
+    if reduction == "full_sequence":
+        denom = weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        return (token_values * weights).sum(dim=-1, keepdim=True).div(denom).expand_as(selected_idx)
+
+    if reduction == "token":
+        gathered_values = token_values.gather(dim=-1, index=selected_idx)
+        gathered_weights = weights.gather(dim=-1, index=selected_idx)
+        return gathered_values * gathered_weights
 
     radius = max(0, int(window_radius))
     if radius == 0:
-        return token_nll.gather(dim=-1, index=selected_idx)
+        gathered_values = token_values.gather(dim=-1, index=selected_idx)
+        gathered_weights = weights.gather(dim=-1, index=selected_idx)
+        return gathered_values * gathered_weights
 
-    bsz, seq_len = token_nll.shape
+    bsz, seq_len = token_values.shape
     select_count = selected_idx.shape[1]
-    offsets = torch.arange(-radius, radius + 1, device=token_nll.device)
+    offsets = torch.arange(-radius, radius + 1, device=token_values.device)
     window_idx = selected_idx.unsqueeze(-1) + offsets.view(1, 1, -1)
     in_bounds = window_idx.ge(0) & window_idx.lt(seq_len)
     safe_idx = window_idx.clamp(min=0, max=seq_len - 1)
-    gathered = token_nll.gather(dim=-1, index=safe_idx.reshape(bsz, -1))
-    gathered = gathered.reshape(bsz, select_count, -1)
-    weights = in_bounds.to(dtype=token_nll.dtype)
-    return (gathered * weights).sum(dim=-1) / weights.sum(dim=-1).clamp(min=1.0)
+    gathered_values = token_values.gather(dim=-1, index=safe_idx.reshape(bsz, -1))
+    gathered_values = gathered_values.reshape(bsz, select_count, -1)
+    gathered_weights = weights.gather(dim=-1, index=safe_idx.reshape(bsz, -1))
+    gathered_weights = gathered_weights.reshape(bsz, select_count, -1)
+    gathered_weights = gathered_weights * in_bounds.to(dtype=token_values.dtype)
+    return (gathered_values * gathered_weights).sum(dim=-1) / gathered_weights.sum(dim=-1).clamp(min=1.0)
+
+
+def _safe_token_nll(logits, target_tokens, valid_mask=None):
+    """Compute token NLL while replacing ignored/invalid target ids with a safe class."""
+    if valid_mask is None:
+        valid_mask = torch.ones_like(target_tokens, dtype=torch.bool)
+    valid_mask = valid_mask.bool() & target_tokens.ge(0) & target_tokens.lt(logits.shape[-1])
+    safe_targets = torch.where(valid_mask, target_tokens, torch.zeros_like(target_tokens))
+    return compute_token_nll(logits, safe_targets), valid_mask
+
+
+@torch.no_grad()
+def compute_prompt_delta_nll(
+    model,
+    token_ids,
+    selected_idx,
+    selected_valid,
+    condition,
+    condition_pooled,
+    none_condition,
+    none_condition_pooled,
+    counterfactual_utility="local_window_prompt",
+    window_radius=0,
+    probe_chunk_size=64,
+    ratio=None,
+    guidance_scale=12.0,
+    sample_aesthetic_score=6.5,
+    guidance_decay="cosine",
+    guidance_decay_scale_pow=1.0,
+):
+    """Score prompt utility with masked probes instead of visible-token self-reconstruction."""
+    if none_condition is None or none_condition_pooled is None:
+        raise ValueError("Prompt counterfactual utilities require none_condition and none_condition_pooled.")
+
+    utility = _canonical_counterfactual_utility(counterfactual_utility)
+    reduction = _counterfactual_utility_reduction(utility)
+    mask_token_id = int(model.mask_token_id)
+    token_ids = token_ids.long()
+    selected_idx = selected_idx.long()
+    selected_valid = selected_valid.bool()
+    bsz, seq_len = token_ids.shape
+    out = torch.zeros(selected_idx.shape, dtype=torch.float32, device=token_ids.device)
+    out_valid = torch.zeros_like(selected_valid, dtype=torch.bool)
+    chunk_size = max(1, int(probe_chunk_size))
+
+    def _score_probe_batch(probe_tokens, target_tokens, target_mask, cond, cond_pooled, uncond, uncond_pooled):
+        cond_logits, _, _ = forward_maskgen(
+            model=model,
+            input_ids=probe_tokens,
+            condition=cond,
+            condition_pooled=cond_pooled,
+            ratio=ratio,
+            guidance_scale=guidance_scale,
+            sample_aesthetic_score=sample_aesthetic_score,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+        )
+        uncond_logits, _, _ = forward_maskgen(
+            model=model,
+            input_ids=probe_tokens,
+            condition=uncond,
+            condition_pooled=uncond_pooled,
+            ratio=ratio,
+            guidance_scale=guidance_scale,
+            sample_aesthetic_score=sample_aesthetic_score,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+        )
+        target_mask = target_mask.bool() & target_tokens.ne(mask_token_id)
+        cond_nll, target_mask = _safe_token_nll(cond_logits, target_tokens, valid_mask=target_mask)
+        uncond_nll, target_mask = _safe_token_nll(uncond_logits, target_tokens, valid_mask=target_mask)
+        return uncond_nll - cond_nll, target_mask
+
+    if reduction == "full_sequence":
+        visible_pair = torch.nonzero(token_ids.ne(mask_token_id), as_tuple=False)
+        full_sum = torch.zeros((bsz,), dtype=torch.float32, device=token_ids.device)
+        full_count = torch.zeros((bsz,), dtype=torch.float32, device=token_ids.device)
+        for start in range(0, visible_pair.shape[0], chunk_size):
+            part = visible_pair[start:start + chunk_size]
+            if part.numel() == 0:
+                continue
+            b_idx = part[:, 0]
+            pos_idx = part[:, 1]
+            probe_tokens = token_ids[b_idx].clone()
+            target_tokens = token_ids[b_idx]
+            target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
+            row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
+            probe_tokens[row, pos_idx] = mask_token_id
+            target_mask[row, pos_idx] = True
+            delta, target_mask = _score_probe_batch(
+                probe_tokens,
+                target_tokens,
+                target_mask,
+                condition[b_idx],
+                condition_pooled[b_idx],
+                none_condition[b_idx],
+                none_condition_pooled[b_idx],
+            )
+            values = delta[row, pos_idx]
+            keep = target_mask[row, pos_idx].to(dtype=torch.float32)
+            full_sum.scatter_add_(0, b_idx, values.float() * keep)
+            full_count.scatter_add_(0, b_idx, keep)
+
+        full_score = full_sum / full_count.clamp(min=1.0)
+        out = full_score.unsqueeze(-1).expand_as(selected_idx).to(dtype=out.dtype)
+        out_valid = selected_valid & full_count.unsqueeze(-1).gt(0)
+        return out, out_valid
+
+    pair = torch.nonzero(selected_valid, as_tuple=False)
+    if pair.numel() == 0:
+        return out, out_valid
+
+    for start in range(0, pair.shape[0], chunk_size):
+        part = pair[start:start + chunk_size]
+        if part.numel() == 0:
+            continue
+        b_idx = part[:, 0]
+        k_idx = part[:, 1]
+        tok_idx = selected_idx[b_idx, k_idx]
+        in_bounds = tok_idx.ge(0) & tok_idx.lt(seq_len)
+        safe_tok_idx = tok_idx.clamp(min=0, max=seq_len - 1)
+
+        probe_tokens = token_ids[b_idx].clone()
+        target_tokens = token_ids[b_idx]
+        target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
+        row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
+
+        if reduction == "token":
+            keep = in_bounds & target_tokens[row, safe_tok_idx].ne(mask_token_id)
+            keep_row = row[keep]
+            keep_pos = safe_tok_idx[keep]
+            if keep_row.numel() > 0:
+                probe_tokens[keep_row, keep_pos] = mask_token_id
+                target_mask[keep_row, keep_pos] = True
+        else:
+            radius = max(0, int(window_radius))
+            for offset in range(-radius, radius + 1):
+                pos = tok_idx + int(offset)
+                keep = pos.ge(0) & pos.lt(seq_len)
+                safe_pos = pos.clamp(min=0, max=seq_len - 1)
+                keep = keep & target_tokens[row, safe_pos].ne(mask_token_id)
+                keep_row = row[keep]
+                keep_pos = safe_pos[keep]
+                if keep_row.numel() > 0:
+                    probe_tokens[keep_row, keep_pos] = mask_token_id
+                    target_mask[keep_row, keep_pos] = True
+
+        delta, target_mask = _score_probe_batch(
+            probe_tokens,
+            target_tokens,
+            target_mask,
+            condition[b_idx],
+            condition_pooled[b_idx],
+            none_condition[b_idx],
+            none_condition_pooled[b_idx],
+        )
+        denom = target_mask.to(dtype=delta.dtype).sum(dim=-1)
+        score = (delta * target_mask.to(dtype=delta.dtype)).sum(dim=-1) / denom.clamp(min=1.0)
+        valid = denom.gt(0)
+        out[b_idx, k_idx] = score.to(dtype=out.dtype)
+        out_valid[b_idx, k_idx] = valid
+
+    return out, out_valid
+
+
+def _resolve_contrast_negative_count(bank_size, negative_count):
+    """Resolve how many mismatched prompts to use from the local prompt bank."""
+    bank_size = int(bank_size)
+    if bank_size <= 1:
+        return 0
+    requested = int(negative_count)
+    if requested <= 0:
+        requested = bank_size - 1
+    return min(requested, bank_size - 1)
+
+
+def _contrast_negative_indices(positive_indices, bank_size, negative_count):
+    """Pick deterministic batch-negative prompt indices for each positive row."""
+    neg_count = _resolve_contrast_negative_count(bank_size, negative_count)
+    if neg_count <= 0:
+        return positive_indices.new_zeros((positive_indices.numel(), 0))
+    positive_indices = positive_indices.long().remainder(int(bank_size)).reshape(-1)
+    offsets = torch.arange(1, neg_count + 1, device=positive_indices.device)
+    return (positive_indices.unsqueeze(-1) + offsets.unsqueeze(0)).remainder(int(bank_size))
+
+
+def _contrastive_prompt_utility_from_scores(scores, temperature=1.0, mode="nce"):
+    """Convert per-prompt scores to a matched-vs-mismatched utility."""
+    tau = max(float(temperature), 1e-6)
+    scaled = scores / tau
+    mode = str(mode or "nce").strip().lower()
+    if mode in {"nce", "infonce", "info_nce", "softmax", "logprob", "log_prob"}:
+        return scaled[:, 0] - torch.logsumexp(scaled, dim=-1)
+    if mode in {"neg_logsumexp", "negatives", "contrast", "contrastive"}:
+        return scaled[:, 0] - torch.logsumexp(scaled[:, 1:], dim=-1)
+    raise ValueError(
+        f"Unsupported counterfactual_contrast_mode={mode!r}. "
+        "Expected nce or neg_logsumexp."
+    )
+
+
+@torch.no_grad()
+def compute_contrastive_prompt_utility(
+    model,
+    token_ids,
+    selected_idx,
+    selected_valid,
+    condition,
+    condition_pooled,
+    condition_bank=None,
+    condition_pooled_bank=None,
+    positive_indices=None,
+    counterfactual_utility="local_window_contrast",
+    window_radius=0,
+    negative_count=2,
+    temperature=1.0,
+    contrast_mode="nce",
+    probe_chunk_size=64,
+    ratio=None,
+    guidance_scale=12.0,
+    sample_aesthetic_score=6.5,
+    guidance_decay="cosine",
+    guidance_decay_scale_pow=1.0,
+):
+    """Score prompt specificity by contrasting matched prompts with batch-mismatched prompts."""
+    utility = _canonical_counterfactual_utility(counterfactual_utility)
+    reduction = _counterfactual_utility_reduction(utility)
+    mask_token_id = int(model.mask_token_id)
+    token_ids = token_ids.long()
+    selected_idx = selected_idx.long()
+    selected_valid = selected_valid.bool()
+    bsz, seq_len = token_ids.shape
+    out = torch.zeros(selected_idx.shape, dtype=torch.float32, device=token_ids.device)
+    out_valid = torch.zeros_like(selected_valid, dtype=torch.bool)
+    chunk_size = max(1, int(probe_chunk_size))
+
+    if condition_bank is None:
+        condition_bank = condition
+    if condition_pooled_bank is None:
+        condition_pooled_bank = condition_pooled
+    bank_size = int(condition_bank.shape[0])
+    neg_count = _resolve_contrast_negative_count(bank_size, negative_count)
+    if neg_count <= 0:
+        raise ValueError("Contrastive prompt utilities require at least two prompts in the local batch.")
+    candidate_count = 1 + neg_count
+
+    if positive_indices is None:
+        positive_indices = torch.arange(bsz, device=token_ids.device)
+    positive_indices = positive_indices.to(device=token_ids.device, dtype=torch.long).reshape(-1)
+    if positive_indices.numel() != bsz:
+        raise ValueError(
+            f"positive_indices must have one entry per token row; got {positive_indices.numel()} for batch {bsz}."
+        )
+
+    def _candidate_nll_batch(probe_tokens, target_tokens, target_mask, pos_cond, pos_pooled, pos_bank_idx):
+        row_count = probe_tokens.shape[0]
+        neg_idx = _contrast_negative_indices(pos_bank_idx, bank_size, neg_count)
+        neg_cond = condition_bank[neg_idx.reshape(-1)].reshape(row_count, neg_count, *condition_bank.shape[1:])
+        neg_pooled = condition_pooled_bank[neg_idx.reshape(-1)].reshape(
+            row_count,
+            neg_count,
+            *condition_pooled_bank.shape[1:],
+        )
+        prompt_cond = torch.cat([pos_cond.unsqueeze(1), neg_cond], dim=1)
+        prompt_pooled = torch.cat([pos_pooled.unsqueeze(1), neg_pooled], dim=1)
+        probe_all = probe_tokens.unsqueeze(1).expand(-1, candidate_count, -1).reshape(row_count * candidate_count, -1)
+        cond_all = prompt_cond.reshape(row_count * candidate_count, *prompt_cond.shape[2:])
+        pooled_all = prompt_pooled.reshape(row_count * candidate_count, *prompt_pooled.shape[2:])
+        target_all = target_tokens.unsqueeze(1).expand(-1, candidate_count, -1).reshape(row_count * candidate_count, -1)
+        mask_all = target_mask.unsqueeze(1).expand(-1, candidate_count, -1).reshape(row_count * candidate_count, -1)
+
+        logits, _, _ = forward_maskgen(
+            model=model,
+            input_ids=probe_all,
+            condition=cond_all,
+            condition_pooled=pooled_all,
+            ratio=ratio,
+            guidance_scale=guidance_scale,
+            sample_aesthetic_score=sample_aesthetic_score,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+        )
+        mask_all = mask_all.bool() & target_all.ne(mask_token_id)
+        token_nll, mask_all = _safe_token_nll(logits, target_all, valid_mask=mask_all)
+        token_nll = token_nll.reshape(row_count, candidate_count, -1)
+        mask_all = mask_all.reshape(row_count, candidate_count, -1)
+        count = mask_all.to(dtype=token_nll.dtype).sum(dim=-1)
+        nll = (token_nll * mask_all.to(dtype=token_nll.dtype)).sum(dim=-1) / count.clamp(min=1.0)
+        return nll, count[:, 0]
+
+    if reduction == "full_sequence":
+        visible_pair = torch.nonzero(token_ids.ne(mask_token_id), as_tuple=False)
+        full_sum = torch.zeros((bsz, candidate_count), dtype=torch.float32, device=token_ids.device)
+        full_count = torch.zeros((bsz,), dtype=torch.float32, device=token_ids.device)
+        for start in range(0, visible_pair.shape[0], chunk_size):
+            part = visible_pair[start:start + chunk_size]
+            if part.numel() == 0:
+                continue
+            b_idx = part[:, 0]
+            pos_idx = part[:, 1]
+            probe_tokens = token_ids[b_idx].clone()
+            target_tokens = token_ids[b_idx]
+            target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
+            row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
+            probe_tokens[row, pos_idx] = mask_token_id
+            target_mask[row, pos_idx] = True
+            nll, count = _candidate_nll_batch(
+                probe_tokens,
+                target_tokens,
+                target_mask,
+                condition[b_idx],
+                condition_pooled[b_idx],
+                positive_indices[b_idx],
+            )
+            keep = count.float()
+            full_sum.scatter_add_(0, b_idx.unsqueeze(-1).expand(-1, candidate_count), nll.float() * keep.unsqueeze(-1))
+            full_count.scatter_add_(0, b_idx, keep)
+
+        avg_nll = full_sum / full_count.clamp(min=1.0).unsqueeze(-1)
+        full_score = _contrastive_prompt_utility_from_scores(
+            -avg_nll,
+            temperature=temperature,
+            mode=contrast_mode,
+        )
+        out = full_score.unsqueeze(-1).expand_as(selected_idx).to(dtype=out.dtype)
+        out_valid = selected_valid & full_count.unsqueeze(-1).gt(0)
+        return out, out_valid
+
+    pair = torch.nonzero(selected_valid, as_tuple=False)
+    if pair.numel() == 0:
+        return out, out_valid
+
+    for start in range(0, pair.shape[0], chunk_size):
+        part = pair[start:start + chunk_size]
+        if part.numel() == 0:
+            continue
+        b_idx = part[:, 0]
+        k_idx = part[:, 1]
+        tok_idx = selected_idx[b_idx, k_idx]
+        in_bounds = tok_idx.ge(0) & tok_idx.lt(seq_len)
+        safe_tok_idx = tok_idx.clamp(min=0, max=seq_len - 1)
+
+        probe_tokens = token_ids[b_idx].clone()
+        target_tokens = token_ids[b_idx]
+        target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
+        row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
+
+        if reduction == "token":
+            keep = in_bounds & target_tokens[row, safe_tok_idx].ne(mask_token_id)
+            keep_row = row[keep]
+            keep_pos = safe_tok_idx[keep]
+            if keep_row.numel() > 0:
+                probe_tokens[keep_row, keep_pos] = mask_token_id
+                target_mask[keep_row, keep_pos] = True
+        else:
+            radius = max(0, int(window_radius))
+            for offset in range(-radius, radius + 1):
+                pos = tok_idx + int(offset)
+                keep = pos.ge(0) & pos.lt(seq_len)
+                safe_pos = pos.clamp(min=0, max=seq_len - 1)
+                keep = keep & target_tokens[row, safe_pos].ne(mask_token_id)
+                keep_row = row[keep]
+                keep_pos = safe_pos[keep]
+                if keep_row.numel() > 0:
+                    probe_tokens[keep_row, keep_pos] = mask_token_id
+                    target_mask[keep_row, keep_pos] = True
+
+        nll, count = _candidate_nll_batch(
+            probe_tokens,
+            target_tokens,
+            target_mask,
+            condition[b_idx],
+            condition_pooled[b_idx],
+            positive_indices[b_idx],
+        )
+        score = _contrastive_prompt_utility_from_scores(
+            -nll,
+            temperature=temperature,
+            mode=contrast_mode,
+        )
+        valid = count.gt(0)
+        out[b_idx, k_idx] = score.to(dtype=out.dtype)
+        out_valid[b_idx, k_idx] = valid
+
+    return out, out_valid
 
 
 def transform_regret_targets(regrets, transform="tanh", valid_mask=None, eps=1e-6):
@@ -260,6 +735,9 @@ def compute_counterfactual_regret(
     counterfactual_rollout_steps=1,
     counterfactual_utility="token_ce",
     counterfactual_window_radius=0,
+    counterfactual_contrast_negatives=2,
+    counterfactual_contrast_temperature=1.0,
+    counterfactual_contrast_mode="nce",
     num_sample_steps=16,
     guidance_scale=12.0,
     randomize_temperature=1.5,
@@ -272,7 +750,7 @@ def compute_counterfactual_regret(
     none_condition=None,
     none_condition_pooled=None,
 ):
-    """Compute CE regret after remasking token i and rolling through plain MaskGen steps.
+    """Compute counterfactual regret after remasking token i and rolling through plain MaskGen steps.
 
     The current rollout path uses one shared start step for the whole batch and never applies critic remasking.
     """
@@ -365,12 +843,16 @@ def compute_counterfactual_regret(
         raise ValueError("compute_counterfactual_regret requires step_indices from build_rollout_state.")
 
     utility_name = _canonical_counterfactual_utility(counterfactual_utility)
+    utility_family = _counterfactual_utility_family(utility_name)
     window_radius = max(0, int(counterfactual_window_radius))
     start_step = int(step_indices[0].item())
     _debug(
         f"start_step={start_step} num_sample_steps={int(num_sample_steps)} "
         f"rollout_steps={int(counterfactual_rollout_steps)} chunk_size={int(counterfactual_chunk_size)} "
-        f"utility={utility_name} window_radius={window_radius} repair_greedy={bool(repair_greedy)}"
+        f"utility={utility_name} window_radius={window_radius} "
+        f"contrast_negatives={int(counterfactual_contrast_negatives)} "
+        f"contrast_temperature={float(counterfactual_contrast_temperature):.6g} "
+        f"contrast_mode={counterfactual_contrast_mode} repair_greedy={bool(repair_greedy)}"
     )
     _debug_tensor("gt_tokens", gt_tokens)
     _debug_tensor("z_t", z_t)
@@ -403,29 +885,78 @@ def compute_counterfactual_regret(
     _debug_token_delta("z_t -> baseline_tokens", z_t, baseline_tokens)
     _debug_tensor("baseline_tokens", baseline_tokens)
 
-    baseline_logits, _, _ = forward_maskgen(
-        model=model,
-        input_ids=baseline_tokens,
-        condition=condition,
-        condition_pooled=condition_pooled,
-        ratio=target_ratio,
-        guidance_scale=guidance_scale,
-        sample_aesthetic_score=sample_aesthetic_score,
-        guidance_decay=guidance_decay,
-        guidance_decay_scale_pow=guidance_decay_scale_pow,
-        none_condition=none_condition,
-        none_condition_pooled=none_condition_pooled,
-    )
-    _debug_tensor("baseline_logits", baseline_logits)
+    if utility_family == "prompt":
+        baseline_selected, baseline_utility_mask = compute_prompt_delta_nll(
+            model=model,
+            token_ids=baseline_tokens,
+            selected_idx=selected_idx,
+            selected_valid=selected_valid,
+            condition=condition,
+            condition_pooled=condition_pooled,
+            none_condition=none_condition,
+            none_condition_pooled=none_condition_pooled,
+            counterfactual_utility=utility_name,
+            window_radius=window_radius,
+            probe_chunk_size=counterfactual_chunk_size,
+            ratio=target_ratio,
+            guidance_scale=guidance_scale,
+            sample_aesthetic_score=sample_aesthetic_score,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+        )
+        baseline_selected = baseline_selected.to(dtype=torch.float32)
+        _debug_tensor("baseline_prompt_selected_utility", baseline_selected)
+        _debug_tensor("baseline_prompt_utility_mask", baseline_utility_mask)
+    elif utility_family == "contrast":
+        baseline_selected, baseline_utility_mask = compute_contrastive_prompt_utility(
+            model=model,
+            token_ids=baseline_tokens,
+            selected_idx=selected_idx,
+            selected_valid=selected_valid,
+            condition=condition,
+            condition_pooled=condition_pooled,
+            condition_bank=condition,
+            condition_pooled_bank=condition_pooled,
+            positive_indices=torch.arange(baseline_tokens.shape[0], device=baseline_tokens.device),
+            counterfactual_utility=utility_name,
+            window_radius=window_radius,
+            negative_count=counterfactual_contrast_negatives,
+            temperature=counterfactual_contrast_temperature,
+            contrast_mode=counterfactual_contrast_mode,
+            probe_chunk_size=counterfactual_chunk_size,
+            ratio=target_ratio,
+            guidance_scale=guidance_scale,
+            sample_aesthetic_score=sample_aesthetic_score,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+        )
+        baseline_selected = baseline_selected.to(dtype=torch.float32)
+        _debug_tensor("baseline_contrast_selected_utility", baseline_selected)
+        _debug_tensor("baseline_contrast_utility_mask", baseline_utility_mask)
+    else:
+        baseline_logits, _, _ = forward_maskgen(
+            model=model,
+            input_ids=baseline_tokens,
+            condition=condition,
+            condition_pooled=condition_pooled,
+            ratio=target_ratio,
+            guidance_scale=guidance_scale,
+            sample_aesthetic_score=sample_aesthetic_score,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+            none_condition=none_condition,
+            none_condition_pooled=none_condition_pooled,
+        )
+        _debug_tensor("baseline_logits", baseline_logits)
 
-    baseline_token_nll = compute_token_nll(baseline_logits, gt_tokens)
-    baseline_selected = _reduce_counterfactual_utility(
-        baseline_token_nll,
-        selected_idx,
-        utility_name,
-        window_radius,
-    ).to(dtype=baseline_token_nll.dtype)
-    _debug_tensor("baseline_token_nll", baseline_token_nll)
+        baseline_token_nll = compute_token_nll(baseline_logits, gt_tokens)
+        baseline_selected = _reduce_counterfactual_utility(
+            baseline_token_nll,
+            selected_idx,
+            utility_name,
+            window_radius,
+        ).to(dtype=baseline_token_nll.dtype)
+        _debug_tensor("baseline_token_nll", baseline_token_nll)
     _debug_tensor("baseline_selected_utility", baseline_selected)
 
     counterfactual_regrets = torch.zeros_like(baseline_selected)
@@ -487,36 +1018,92 @@ def compute_counterfactual_regret(
             _debug_token_delta(f"chunk={chunk_id} baseline_tokens[b_idx] -> cf_tokens", baseline_tokens[b_idx], cf_tokens)
             _debug_tensor(f"chunk={chunk_id} cf_tokens", cf_tokens)
 
-        logits_cf, _, _ = forward_maskgen(
-            model=model,
-            input_ids=cf_tokens,
-            condition=condition[b_idx],
-            condition_pooled=condition_pooled[b_idx],
-            ratio=cf_ratio,
-            guidance_scale=guidance_scale,
-            sample_aesthetic_score=sample_aesthetic_score,
-            guidance_decay=guidance_decay,
-            guidance_decay_scale_pow=guidance_decay_scale_pow,
-            none_condition=none_condition[b_idx] if none_condition is not None else None,
-            none_condition_pooled=none_condition_pooled[b_idx] if none_condition_pooled is not None else None,
-        )
-        if debug_chunk:
-            _debug_tensor(f"chunk={chunk_id} logits_cf", logits_cf)
+        if utility_family == "prompt":
+            cf_selected, cf_utility_mask = compute_prompt_delta_nll(
+                model=model,
+                token_ids=cf_tokens,
+                selected_idx=tok_idx.unsqueeze(-1),
+                selected_valid=selected_valid[b_idx, k_idx].unsqueeze(-1),
+                condition=condition[b_idx],
+                condition_pooled=condition_pooled[b_idx],
+                none_condition=none_condition[b_idx] if none_condition is not None else None,
+                none_condition_pooled=none_condition_pooled[b_idx] if none_condition_pooled is not None else None,
+                counterfactual_utility=utility_name,
+                window_radius=window_radius,
+                probe_chunk_size=counterfactual_chunk_size,
+                ratio=cf_ratio,
+                guidance_scale=guidance_scale,
+                sample_aesthetic_score=sample_aesthetic_score,
+                guidance_decay=guidance_decay,
+                guidance_decay_scale_pow=guidance_decay_scale_pow,
+            )
+            cf_selected = cf_selected.squeeze(-1)
+            cf_utility_mask = cf_utility_mask.squeeze(-1)
+            chunk_regret = cf_selected - baseline_selected[b_idx, k_idx]
+            if debug_chunk:
+                _debug_tensor(f"chunk={chunk_id} cf_prompt_selected_utility", cf_selected)
+                _debug_tensor(f"chunk={chunk_id} cf_prompt_utility_mask", cf_utility_mask)
+        elif utility_family == "contrast":
+            cf_selected, cf_utility_mask = compute_contrastive_prompt_utility(
+                model=model,
+                token_ids=cf_tokens,
+                selected_idx=tok_idx.unsqueeze(-1),
+                selected_valid=selected_valid[b_idx, k_idx].unsqueeze(-1),
+                condition=condition[b_idx],
+                condition_pooled=condition_pooled[b_idx],
+                condition_bank=condition,
+                condition_pooled_bank=condition_pooled,
+                positive_indices=b_idx,
+                counterfactual_utility=utility_name,
+                window_radius=window_radius,
+                negative_count=counterfactual_contrast_negatives,
+                temperature=counterfactual_contrast_temperature,
+                contrast_mode=counterfactual_contrast_mode,
+                probe_chunk_size=counterfactual_chunk_size,
+                ratio=cf_ratio,
+                guidance_scale=guidance_scale,
+                sample_aesthetic_score=sample_aesthetic_score,
+                guidance_decay=guidance_decay,
+                guidance_decay_scale_pow=guidance_decay_scale_pow,
+            )
+            cf_selected = cf_selected.squeeze(-1)
+            cf_utility_mask = cf_utility_mask.squeeze(-1)
+            chunk_regret = cf_selected - baseline_selected[b_idx, k_idx]
+            if debug_chunk:
+                _debug_tensor(f"chunk={chunk_id} cf_contrast_selected_utility", cf_selected)
+                _debug_tensor(f"chunk={chunk_id} cf_contrast_utility_mask", cf_utility_mask)
+        else:
+            logits_cf, _, _ = forward_maskgen(
+                model=model,
+                input_ids=cf_tokens,
+                condition=condition[b_idx],
+                condition_pooled=condition_pooled[b_idx],
+                ratio=cf_ratio,
+                guidance_scale=guidance_scale,
+                sample_aesthetic_score=sample_aesthetic_score,
+                guidance_decay=guidance_decay,
+                guidance_decay_scale_pow=guidance_decay_scale_pow,
+                none_condition=none_condition[b_idx] if none_condition is not None else None,
+                none_condition_pooled=none_condition_pooled[b_idx] if none_condition_pooled is not None else None,
+            )
+            if debug_chunk:
+                _debug_tensor(f"chunk={chunk_id} logits_cf", logits_cf)
 
-        cf_token_nll = compute_token_nll(logits_cf, gt_tokens[b_idx])
-        cf_selected = _reduce_counterfactual_utility(
-            cf_token_nll,
-            tok_idx.unsqueeze(-1),
-            utility_name,
-            window_radius,
-        ).squeeze(-1)
-        chunk_regret = baseline_selected[b_idx, k_idx] - cf_selected
+            cf_token_nll = compute_token_nll(logits_cf, gt_tokens[b_idx])
+            cf_selected = _reduce_counterfactual_utility(
+                cf_token_nll,
+                tok_idx.unsqueeze(-1),
+                utility_name,
+                window_radius,
+            ).squeeze(-1)
+            chunk_regret = baseline_selected[b_idx, k_idx] - cf_selected
         if debug_chunk:
             _debug_tensor(f"chunk={chunk_id} baseline_selected_utility", baseline_selected[b_idx, k_idx])
-            _debug_tensor(f"chunk={chunk_id} cf_token_nll", cf_token_nll)
             _debug_tensor(f"chunk={chunk_id} cf_selected_utility", cf_selected)
             _debug_tensor(f"chunk={chunk_id} regret", chunk_regret)
             _debug_regret_signs(f"chunk={chunk_id} regret_signs", chunk_regret)
+            if utility_family == "ce":
+                _debug_tensor(f"chunk={chunk_id} cf_token_nll", cf_token_nll)
         counterfactual_regrets[b_idx, k_idx] = chunk_regret
 
     valid_regrets = counterfactual_regrets[selected_valid]
@@ -833,6 +1420,14 @@ def _rollout_maskgen_steps(
     return ids, ratio
 
 
+def _critic_prompt_gap_topk(critic):
+    """Return how many cond-minus-uncond logit-gap features a critic expects."""
+    if critic is None:
+        return 0
+    module = critic.module if isinstance(critic, DDP) else critic
+    return max(0, int(getattr(module, "prompt_gap_topk", 0)))
+
+
 @torch.no_grad()
 def critic_remask_tokens(
     model,
@@ -849,35 +1444,59 @@ def critic_remask_tokens(
     guidance_decay_scale_pow=1.0,
     none_condition=None,
     none_condition_pooled=None,
+    remask_min_score=0.0,
 ):
     """Apply critic top-k remasking. `remask_ratio` may be a ratio or an absolute schedule budget."""
     if critic is None:
         return token_ids
     
-    logits, hidden, text_feat = forward_maskgen(
-        model=model,
-        input_ids=token_ids,
-        condition=condition,
-        condition_pooled=condition_pooled,
-        ratio=ratio,
-        guidance_scale=guidance_scale,
-        sample_aesthetic_score=sample_aesthetic_score,
-        guidance_decay=guidance_decay,
-        guidance_decay_scale_pow=guidance_decay_scale_pow,
-        none_condition=none_condition,
-        none_condition_pooled=none_condition_pooled,
-    )
+    use_prompt_gap = _critic_prompt_gap_topk(critic) > 0 and none_condition is not None and none_condition_pooled is not None
+    if use_prompt_gap:
+        logits, hidden, text_feat, cond_logits, uncond_logits = forward_maskgen(
+            model=model,
+            input_ids=token_ids,
+            condition=condition,
+            condition_pooled=condition_pooled,
+            ratio=ratio,
+            guidance_scale=guidance_scale,
+            sample_aesthetic_score=sample_aesthetic_score,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+            none_condition=none_condition,
+            none_condition_pooled=none_condition_pooled,
+            return_cfg_parts=True,
+        )
+        prompt_logits_delta = cond_logits - uncond_logits if uncond_logits is not None else None
+    else:
+        logits, hidden, text_feat = forward_maskgen(
+            model=model,
+            input_ids=token_ids,
+            condition=condition,
+            condition_pooled=condition_pooled,
+            ratio=ratio,
+            guidance_scale=guidance_scale,
+            sample_aesthetic_score=sample_aesthetic_score,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+            none_condition=none_condition,
+            none_condition_pooled=none_condition_pooled,
+        )
+        prompt_logits_delta = None
     timesteps = torch.full((token_ids.shape[0],), ratio, device=token_ids.device)
     selection_scores = critic(
         hidden_states=hidden if bool(critic_use_hidden) else None,
         logits=logits,
         timesteps=timesteps,
         text_features=text_feat,
+        prompt_logits_delta=prompt_logits_delta,
     )
+    candidate_mask = token_ids.ne(int(model.mask_token_id))
+    if remask_min_score is not None:
+        candidate_mask = candidate_mask & selection_scores.gt(float(remask_min_score))
     select_idx, select_valid = select_topk_token_positions(
         selection_scores,
         remask_ratio,
-        candidate_mask=token_ids.ne(int(model.mask_token_id)),
+        candidate_mask=candidate_mask,
         min_tokens=1,
     )
     return remask_positions(token_ids, select_idx, int(model.mask_token_id), valid_mask=select_valid)
@@ -932,6 +1551,7 @@ def build_rollout_state(
     refine_start_step=10,
     critic=None,
     remask_ratio=0.05,
+    remask_min_score=0.0,
     critic_use_hidden=True,
     fixed_step=None,
 ):
@@ -976,6 +1596,7 @@ def build_rollout_state(
                 guidance_scale=guidance_scale,
                 sample_aesthetic_score=sample_aesthetic_score,
                 remask_ratio=critic_budget,
+                remask_min_score=remask_min_score,
                 critic_use_hidden=critic_use_hidden,
                 guidance_decay=guidance_decay,
                 guidance_decay_scale_pow=guidance_decay_scale_pow,
@@ -1030,7 +1651,6 @@ def generate_wrapper(
     refine_loops=None,
 ):
     """Generate tokens with one stepwise engine, optionally inserting CTRC top-k remasking."""
-    _ = remask_min_score
     assert guidance_decay in ["linear", "cosine", "none", "flippedcosine"]
     assert refine_start_step >= 0, "refine_start_step must be non-negative"
     assert refine_start_step < num_sample_steps, "refine_start_step must be less than num_sample_steps"
@@ -1070,6 +1690,7 @@ def generate_wrapper(
                 guidance_scale=guidance_scale,
                 sample_aesthetic_score=sample_aesthetic_score,
                 remask_ratio=critic_budget,
+                remask_min_score=remask_min_score,
                 critic_use_hidden=critic_use_hidden,
                 guidance_decay=guidance_decay,
                 guidance_decay_scale_pow=guidance_decay_scale_pow,
@@ -1154,7 +1775,6 @@ def generate_image_vq_batch(
     refine_loops=None,
 ):
     """Generate image batch from prompts with optional critic-based token refinement."""
-    _ = remask_min_score
     model_device = next(model.parameters()).device
     clip_encoder = clip_encoder.to(model_device)
     tokenizer = tokenizer.to(model_device)
@@ -1180,6 +1800,7 @@ def generate_image_vq_batch(
         critic_use_hidden=bool(critic_use_hidden),
         refine_softmax_temperature=refine_softmax_temperature,
         repair_greedy=bool(repair_greedy),
+        remask_min_score=remask_min_score,
     ).to(model_device)
     text_guidance = prepare_text_guidance(prompts, clip_tokenizer, clip_encoder, model_device)
     image = tokenizer.decode_tokens(tokens, text_guidance)
@@ -1288,6 +1909,9 @@ def apply_cli_overrides(config):
     parser.add_argument("--counterfactual-rollout-steps", type=int)
     parser.add_argument("--counterfactual-utility", type=str)
     parser.add_argument("--counterfactual-window-radius", type=int)
+    parser.add_argument("--counterfactual-contrast-negatives", type=int)
+    parser.add_argument("--counterfactual-contrast-temperature", type=float)
+    parser.add_argument("--counterfactual-contrast-mode", type=str)
     parser.add_argument("--counterfactual-repair-greedy", action="store_true", default=None)
     parser.add_argument(
         "--no-counterfactual-repair-greedy",
@@ -1295,6 +1919,7 @@ def apply_cli_overrides(config):
         dest="counterfactual_repair_greedy",
         default=None,
     )
+    parser.add_argument("--critic-prompt-gap-topk", type=int)
     parser.add_argument("--regret-target-transform", type=str)
     parser.add_argument("--target-critic-ema-decay", type=float)
     parser.add_argument("--fixed-rollout-step", type=int)
@@ -1316,6 +1941,7 @@ def apply_cli_overrides(config):
     parser.add_argument("--rank-margin", type=float)
     parser.add_argument("--rank-gap-threshold", type=float)
     parser.add_argument("--train-remask-ratio", type=float)
+    parser.add_argument("--remask-min-score", type=float)
     parser.add_argument("--train-refine-start-step", type=int)
     parser.add_argument("--refine-loops", type=int)
     parser.add_argument("--save-every", type=int)
@@ -1350,7 +1976,11 @@ def apply_cli_overrides(config):
         (training, "counterfactual_rollout_steps", args.counterfactual_rollout_steps),
         (training, "counterfactual_utility", args.counterfactual_utility),
         (training, "counterfactual_window_radius", args.counterfactual_window_radius),
+        (training, "counterfactual_contrast_negatives", args.counterfactual_contrast_negatives),
+        (training, "counterfactual_contrast_temperature", args.counterfactual_contrast_temperature),
+        (training, "counterfactual_contrast_mode", args.counterfactual_contrast_mode),
         (training, "counterfactual_repair_greedy", args.counterfactual_repair_greedy),
+        (training, "critic_prompt_gap_topk", args.critic_prompt_gap_topk),
         (training, "regret_target_transform", args.regret_target_transform),
         (training, "target_critic_ema_decay", args.target_critic_ema_decay),
         (training, "fixed_rollout_step", args.fixed_rollout_step),
@@ -1361,6 +1991,7 @@ def apply_cli_overrides(config):
         (training, "rank_gap_threshold", args.rank_gap_threshold),
         (training, "train_remask_ratio", args.train_remask_ratio),
         (config.inference, "remask_ratio", args.train_remask_ratio),
+        (config.inference, "remask_min_score", args.remask_min_score),
         (training, "train_refine_start_step", args.train_refine_start_step),
         (config.inference, "refine_start_step", args.train_refine_start_step),
         (training, "refine_loops", args.refine_loops),
@@ -1424,14 +2055,23 @@ def main():
     clip_encoder.eval().requires_grad_(False)
     clip_tokenizer = open_clip.get_tokenizer("ViT-L-14-336")
 
-    critic = build_token_regret_critic(model, use_hidden=True).to(device)
+    critic_prompt_gap_topk = max(0, int(getattr(training, "critic_prompt_gap_topk", 8)))
+    critic = build_token_regret_critic(
+        model,
+        use_hidden=True,
+        prompt_gap_topk=critic_prompt_gap_topk,
+    ).to(device)
 
     use_ddp = world_size > 1 and device.type == "cuda"
     if use_ddp:
         critic = DDP(critic, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
 
     optimizer = torch.optim.AdamW(critic.parameters(), lr=float(training.learning_rate), weight_decay=1e-4)
-    target_critic = build_token_regret_critic(model, use_hidden=True).to(device)
+    target_critic = build_token_regret_critic(
+        model,
+        use_hidden=True,
+        prompt_gap_topk=critic_prompt_gap_topk,
+    ).to(device)
     copy_critic_weights_(target_critic, critic)
     target_ema_decay = max(0.0, min(1.0, float(getattr(training, "target_critic_ema_decay", 0.995))))
 
@@ -1630,24 +2270,46 @@ def main():
                     # checks, disable this so the same images produce stable state distributions.
                     critic=target_critic if use_target_critic_replay else None,
                     remask_ratio=float(training.train_remask_ratio),
+                    remask_min_score=float(getattr(config.inference, "remask_min_score", 0.0)),
                     critic_use_hidden=True,
                     fixed_step=fixed_rollout_step_arg,
                 )
 
-                # Compute the original logits, which will be used as a baseline for the counterfactual regret
-                logits_orig, hidden_orig, text_feat = forward_maskgen(
-                    model=model,
-                    input_ids=z_t,
-                    condition=condition,
-                    condition_pooled=condition_pooled,
-                    ratio=timesteps,
-                    guidance_scale=float(training.train_guidance_scale),
-                    sample_aesthetic_score=train_aes,
-                    guidance_decay="cosine",
-                    guidance_decay_scale_pow=1.0,
-                    none_condition=none_condition,
-                    none_condition_pooled=none_condition_pooled,
-                )
+                use_prompt_gap_features = _critic_prompt_gap_topk(critic) > 0
+                if use_prompt_gap_features:
+                    logits_orig, hidden_orig, text_feat, cond_logits_orig, uncond_logits_orig = forward_maskgen(
+                        model=model,
+                        input_ids=z_t,
+                        condition=condition,
+                        condition_pooled=condition_pooled,
+                        ratio=timesteps,
+                        guidance_scale=float(training.train_guidance_scale),
+                        sample_aesthetic_score=train_aes,
+                        guidance_decay="cosine",
+                        guidance_decay_scale_pow=1.0,
+                        none_condition=none_condition,
+                        none_condition_pooled=none_condition_pooled,
+                        return_cfg_parts=True,
+                    )
+                    prompt_logits_delta_orig = (
+                        cond_logits_orig - uncond_logits_orig if uncond_logits_orig is not None else None
+                    )
+                else:
+                    # Compute the original logits used by the critic at the current decision state.
+                    logits_orig, hidden_orig, text_feat = forward_maskgen(
+                        model=model,
+                        input_ids=z_t,
+                        condition=condition,
+                        condition_pooled=condition_pooled,
+                        ratio=timesteps,
+                        guidance_scale=float(training.train_guidance_scale),
+                        sample_aesthetic_score=train_aes,
+                        guidance_decay="cosine",
+                        guidance_decay_scale_pow=1.0,
+                        none_condition=none_condition,
+                        none_condition_pooled=none_condition_pooled,
+                    )
+                    prompt_logits_delta_orig = None
 
                 base_candidate_mask = z_t.ne(int(model.mask_token_id))
                 selected_idx, selected_valid = select_all_token_positions(base_candidate_mask)
@@ -1667,6 +2329,9 @@ def main():
                     counterfactual_rollout_steps=int(getattr(training, "counterfactual_rollout_steps", 1)),
                     counterfactual_utility=str(getattr(training, "counterfactual_utility", "token_ce")),
                     counterfactual_window_radius=int(getattr(training, "counterfactual_window_radius", 0)),
+                    counterfactual_contrast_negatives=int(getattr(training, "counterfactual_contrast_negatives", 2)),
+                    counterfactual_contrast_temperature=float(getattr(training, "counterfactual_contrast_temperature", 1.0)),
+                    counterfactual_contrast_mode=str(getattr(training, "counterfactual_contrast_mode", "nce")),
                     num_sample_steps=int(model_cfg.sample_steps),
                     guidance_scale=float(training.train_guidance_scale),
                     randomize_temperature=float(training.train_randomize_temperature),
@@ -1683,6 +2348,7 @@ def main():
                 logits=logits_orig,
                 timesteps=timesteps,
                 text_features=text_feat,
+                prompt_logits_delta=prompt_logits_delta_orig,
             )
             pred_sel = pred_regret.gather(dim=-1, index=selected_idx)
             targets = transform_regret_targets(
@@ -1812,6 +2478,8 @@ def main():
                             "train/train_randomize_temperature": float(training.train_randomize_temperature),
                             "train/counterfactual_rollout_steps": int(getattr(training, "counterfactual_rollout_steps", 1)),
                             "train/counterfactual_window_radius": int(getattr(training, "counterfactual_window_radius", 0)),
+                            "train/counterfactual_contrast_negatives": int(getattr(training, "counterfactual_contrast_negatives", 2)),
+                            "train/counterfactual_contrast_temperature": float(getattr(training, "counterfactual_contrast_temperature", 1.0)),
                             "train/counterfactual_repair_greedy": int(bool(getattr(training, "counterfactual_repair_greedy", False))),
                             "train/selected_count": selected_count,
                             "train/selected_fraction": selected_frac,
