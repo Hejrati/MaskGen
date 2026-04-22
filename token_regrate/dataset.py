@@ -169,19 +169,6 @@ def _count_valid_cc12m_rows(tsv_path):
     return total
 
 
-def _infer_hf_example_count(urls):
-    """Infer HF WebDataset example count when using the known default shard set."""
-    if urls is None or len(urls) == 0:
-        return None
-    try:
-        default_urls = _default_hf_shard_urls()
-        if len(urls) == len(default_urls) and all(str(a) == str(b) for a, b in zip(urls, default_urls)):
-            return 1_000_000
-    except Exception:
-        pass
-    return None
-
-
 def _extract_caption_from_sample(sample):
     """Extract a caption string from common WebDataset fields."""
     for key in ("txt", "caption", "text", "prompt"):
@@ -535,11 +522,7 @@ class TrainingDatasetPipeline:
             has_any = True
 
         if self.use_hf:
-            hf_count = _infer_hf_example_count(self.hf_urls)
-            if hf_count is None:
-                return None
-            total += int(hf_count)
-            has_any = True
+            return 1_000_000 if len(self.hf_urls) > 0 else None
 
         return int(total) if has_any else None
 

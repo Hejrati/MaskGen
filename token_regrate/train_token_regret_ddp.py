@@ -1,4 +1,3 @@
-import argparse
 import json
 import math
 import os
@@ -176,81 +175,37 @@ def compute_token_nll(logits, gt_tokens):
 def _canonical_counterfactual_utility(name):
     """Normalize counterfactual target names used by configs and notebooks."""
     name = str(name or "token_ce").strip().lower()
-    aliases = {
-        "full": "full_sequence_ce",
-        "sequence": "full_sequence_ce",
-        "sequence_ce": "full_sequence_ce",
-        "full_ce": "full_sequence_ce",
-        "full_sequence_ce": "full_sequence_ce",
-        "token": "token_ce",
-        "token_ce": "token_ce",
-        "local": "local_window_ce",
-        "local_ce": "local_window_ce",
-        "window": "local_window_ce",
-        "window_ce": "local_window_ce",
-        "patch": "local_window_ce",
-        "patch_ce": "local_window_ce",
-        "neighborhood": "local_window_ce",
-        "neighborhood_ce": "local_window_ce",
-        "local_window_ce": "local_window_ce",
-        "prompt": "local_window_prompt",
-        "prompt_utility": "local_window_prompt",
-        "prompt_token": "token_prompt",
-        "prompt_token_utility": "token_prompt",
-        "token_prompt": "token_prompt",
-        "token_prompt_utility": "token_prompt",
-        "prompt_local": "local_window_prompt",
-        "prompt_local_utility": "local_window_prompt",
-        "prompt_local_window": "local_window_prompt",
-        "prompt_local_window_utility": "local_window_prompt",
-        "local_prompt": "local_window_prompt",
-        "local_prompt_utility": "local_window_prompt",
-        "local_window_prompt": "local_window_prompt",
-        "local_window_prompt_utility": "local_window_prompt",
-        "prompt_full": "full_sequence_prompt",
-        "prompt_full_utility": "full_sequence_prompt",
-        "prompt_sequence": "full_sequence_prompt",
-        "prompt_sequence_utility": "full_sequence_prompt",
-        "prompt_full_sequence": "full_sequence_prompt",
-        "prompt_full_sequence_utility": "full_sequence_prompt",
-        "full_prompt": "full_sequence_prompt",
-        "full_prompt_utility": "full_sequence_prompt",
-        "full_sequence_prompt": "full_sequence_prompt",
-        "full_sequence_prompt_utility": "full_sequence_prompt",
-        "contrast": "local_window_contrast",
-        "contrast_utility": "local_window_contrast",
-        "prompt_contrast": "local_window_contrast",
-        "prompt_contrast_utility": "local_window_contrast",
-        "nce": "local_window_contrast",
-        "prompt_nce": "local_window_contrast",
-        "token_contrast": "token_contrast",
-        "token_nce": "token_contrast",
-        "prompt_token_contrast": "token_contrast",
-        "local_contrast": "local_window_contrast",
-        "local_nce": "local_window_contrast",
-        "window_contrast": "local_window_contrast",
-        "window_nce": "local_window_contrast",
-        "local_window_contrast": "local_window_contrast",
-        "local_window_nce": "local_window_contrast",
-        "prompt_local_contrast": "local_window_contrast",
-        "prompt_local_window_contrast": "local_window_contrast",
-        "full_contrast": "full_sequence_contrast",
-        "full_nce": "full_sequence_contrast",
-        "sequence_contrast": "full_sequence_contrast",
-        "sequence_nce": "full_sequence_contrast",
-        "full_sequence_contrast": "full_sequence_contrast",
-        "full_sequence_nce": "full_sequence_contrast",
-        "prompt_full_contrast": "full_sequence_contrast",
-        "prompt_full_sequence_contrast": "full_sequence_contrast",
+    canonical = {
+        "token_ce",
+        "local_window_ce",
+        "full_sequence_ce",
+        "token_prompt",
+        "local_window_prompt",
+        "full_sequence_prompt",
+        "token_contrast",
+        "local_window_contrast",
+        "full_sequence_contrast",
     }
-    if name not in aliases:
-        raise ValueError(
-            f"Unsupported counterfactual_utility={name!r}. "
-            "Expected token_ce, local_window_ce, full_sequence_ce, "
-            "token_prompt, local_window_prompt, full_sequence_prompt, "
-            "token_contrast, local_window_contrast, or full_sequence_contrast."
-        )
-    return aliases[name]
+    if name in canonical:
+        return name
+
+    aliases = {
+        "token": "token_ce",
+        "local": "local_window_ce",
+        "full": "full_sequence_ce",
+        "prompt": "local_window_prompt",
+        "contrast": "local_window_contrast",
+    }
+    if name in aliases:
+        return aliases[name]
+
+    raise ValueError(
+        f"Unsupported counterfactual_utility={name!r}. "
+        "Expected token_ce, local_window_ce, full_sequence_ce, "
+        "token_prompt, local_window_prompt, full_sequence_prompt, "
+        "token_contrast, local_window_contrast, or full_sequence_contrast. "
+        "Supported shorthands: token, local, full, prompt, contrast."
+    )
 
 
 def _counterfactual_utility_family(counterfactual_utility):
@@ -310,13 +265,51 @@ def _reduce_counterfactual_utility(token_values, selected_idx, counterfactual_ut
     return (gathered_values * gathered_weights).sum(dim=-1) / gathered_weights.sum(dim=-1).clamp(min=1.0)
 
 
-def _safe_token_nll(logits, target_tokens, valid_mask=None):
-    """Compute token NLL while replacing ignored/invalid target ids with a safe class."""
+def _masked_token_nll(logits, target_tokens, valid_mask):
+    """Compute token NLL only at valid positions used by probe scoring."""
     if valid_mask is None:
         valid_mask = torch.ones_like(target_tokens, dtype=torch.bool)
     valid_mask = valid_mask.bool() & target_tokens.ge(0) & target_tokens.lt(logits.shape[-1])
-    safe_targets = torch.where(valid_mask, target_tokens, torch.zeros_like(target_tokens))
-    return compute_token_nll(logits, safe_targets), valid_mask
+    token_nll = torch.zeros_like(target_tokens, dtype=logits.dtype)
+    if not bool(valid_mask.any()):
+        return token_nll, valid_mask
+
+    flat_mask = valid_mask.reshape(-1)
+    flat_logits = logits.reshape(-1, logits.shape[-1])[flat_mask]
+    flat_targets = target_tokens.reshape(-1)[flat_mask]
+    flat_nll = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+    token_nll.reshape(-1)[flat_mask] = flat_nll
+    return token_nll, valid_mask
+
+
+def _build_masked_probe_inputs(target_tokens, token_positions, mask_token_id, window_radius=0):
+    """Build per-row masked probe inputs for token or local-window prompt utilities."""
+    probe_tokens = target_tokens.clone()
+    target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
+    if token_positions.numel() == 0:
+        return probe_tokens, target_mask
+
+    seq_len = int(target_tokens.shape[1])
+    row = torch.arange(target_tokens.shape[0], device=target_tokens.device)
+    radius = max(0, int(window_radius))
+    if radius == 0:
+        safe_pos = token_positions.clamp(min=0, max=seq_len - 1)
+        keep = token_positions.ge(0) & token_positions.lt(seq_len)
+        keep = keep & target_tokens[row, safe_pos].ne(int(mask_token_id))
+        if bool(keep.any()):
+            target_mask[row[keep], safe_pos[keep]] = True
+    else:
+        offsets = torch.arange(-radius, radius + 1, device=target_tokens.device)
+        window_idx = token_positions.unsqueeze(-1) + offsets.view(1, -1)
+        in_bounds = window_idx.ge(0) & window_idx.lt(seq_len)
+        safe_pos = window_idx.clamp(min=0, max=seq_len - 1)
+        row_idx = row.unsqueeze(-1).expand_as(safe_pos)
+        keep = in_bounds & target_tokens.gather(dim=-1, index=safe_pos).ne(int(mask_token_id))
+        if bool(keep.any()):
+            target_mask[row_idx[keep], safe_pos[keep]] = True
+
+    probe_tokens[target_mask] = int(mask_token_id)
+    return probe_tokens, target_mask
 
 
 @torch.no_grad()
@@ -348,10 +341,11 @@ def compute_prompt_delta_nll(
     token_ids = token_ids.long()
     selected_idx = selected_idx.long()
     selected_valid = selected_valid.bool()
-    bsz, seq_len = token_ids.shape
+    bsz = token_ids.shape[0]
     out = torch.zeros(selected_idx.shape, dtype=torch.float32, device=token_ids.device)
     out_valid = torch.zeros_like(selected_valid, dtype=torch.bool)
     chunk_size = max(1, int(probe_chunk_size))
+    probe_window_radius = max(0, int(window_radius)) if reduction == "local_window" else 0
 
     def _score_probe_batch(probe_tokens, target_tokens, target_mask, cond, cond_pooled, uncond, uncond_pooled):
         cond_logits, _, _ = forward_maskgen(
@@ -377,8 +371,8 @@ def compute_prompt_delta_nll(
             guidance_decay_scale_pow=guidance_decay_scale_pow,
         )
         target_mask = target_mask.bool() & target_tokens.ne(mask_token_id)
-        cond_nll, target_mask = _safe_token_nll(cond_logits, target_tokens, valid_mask=target_mask)
-        uncond_nll, target_mask = _safe_token_nll(uncond_logits, target_tokens, valid_mask=target_mask)
+        cond_nll, target_mask = _masked_token_nll(cond_logits, target_tokens, valid_mask=target_mask)
+        uncond_nll, target_mask = _masked_token_nll(uncond_logits, target_tokens, valid_mask=target_mask)
         return uncond_nll - cond_nll, target_mask
 
     if reduction == "full_sequence":
@@ -391,12 +385,14 @@ def compute_prompt_delta_nll(
                 continue
             b_idx = part[:, 0]
             pos_idx = part[:, 1]
-            probe_tokens = token_ids[b_idx].clone()
             target_tokens = token_ids[b_idx]
-            target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
+            probe_tokens, target_mask = _build_masked_probe_inputs(
+                target_tokens,
+                pos_idx,
+                mask_token_id,
+                window_radius=0,
+            )
             row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
-            probe_tokens[row, pos_idx] = mask_token_id
-            target_mask[row, pos_idx] = True
             delta, target_mask = _score_probe_batch(
                 probe_tokens,
                 target_tokens,
@@ -427,33 +423,13 @@ def compute_prompt_delta_nll(
         b_idx = part[:, 0]
         k_idx = part[:, 1]
         tok_idx = selected_idx[b_idx, k_idx]
-        in_bounds = tok_idx.ge(0) & tok_idx.lt(seq_len)
-        safe_tok_idx = tok_idx.clamp(min=0, max=seq_len - 1)
-
-        probe_tokens = token_ids[b_idx].clone()
         target_tokens = token_ids[b_idx]
-        target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
-        row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
-
-        if reduction == "token":
-            keep = in_bounds & target_tokens[row, safe_tok_idx].ne(mask_token_id)
-            keep_row = row[keep]
-            keep_pos = safe_tok_idx[keep]
-            if keep_row.numel() > 0:
-                probe_tokens[keep_row, keep_pos] = mask_token_id
-                target_mask[keep_row, keep_pos] = True
-        else:
-            radius = max(0, int(window_radius))
-            for offset in range(-radius, radius + 1):
-                pos = tok_idx + int(offset)
-                keep = pos.ge(0) & pos.lt(seq_len)
-                safe_pos = pos.clamp(min=0, max=seq_len - 1)
-                keep = keep & target_tokens[row, safe_pos].ne(mask_token_id)
-                keep_row = row[keep]
-                keep_pos = safe_pos[keep]
-                if keep_row.numel() > 0:
-                    probe_tokens[keep_row, keep_pos] = mask_token_id
-                    target_mask[keep_row, keep_pos] = True
+        probe_tokens, target_mask = _build_masked_probe_inputs(
+            target_tokens,
+            tok_idx,
+            mask_token_id,
+            window_radius=probe_window_radius,
+        )
 
         delta, target_mask = _score_probe_batch(
             probe_tokens,
@@ -539,7 +515,7 @@ def compute_contrastive_prompt_utility(
     token_ids = token_ids.long()
     selected_idx = selected_idx.long()
     selected_valid = selected_valid.bool()
-    bsz, seq_len = token_ids.shape
+    bsz = token_ids.shape[0]
     out = torch.zeros(selected_idx.shape, dtype=torch.float32, device=token_ids.device)
     out_valid = torch.zeros_like(selected_valid, dtype=torch.bool)
     chunk_size = max(1, int(probe_chunk_size))
@@ -550,8 +526,6 @@ def compute_contrastive_prompt_utility(
         condition_pooled_bank = condition_pooled
     bank_size = int(condition_bank.shape[0])
     neg_count = _resolve_contrast_negative_count(bank_size, negative_count)
-    if neg_count <= 0:
-        raise ValueError("Contrastive prompt utilities require at least two prompts in the local batch.")
     candidate_count = 1 + neg_count
 
     if positive_indices is None:
@@ -591,7 +565,7 @@ def compute_contrastive_prompt_utility(
             guidance_decay_scale_pow=guidance_decay_scale_pow,
         )
         mask_all = mask_all.bool() & target_all.ne(mask_token_id)
-        token_nll, mask_all = _safe_token_nll(logits, target_all, valid_mask=mask_all)
+        token_nll, mask_all = _masked_token_nll(logits, target_all, valid_mask=mask_all)
         token_nll = token_nll.reshape(row_count, candidate_count, -1)
         mask_all = mask_all.reshape(row_count, candidate_count, -1)
         count = mask_all.to(dtype=token_nll.dtype).sum(dim=-1)
@@ -608,12 +582,13 @@ def compute_contrastive_prompt_utility(
                 continue
             b_idx = part[:, 0]
             pos_idx = part[:, 1]
-            probe_tokens = token_ids[b_idx].clone()
             target_tokens = token_ids[b_idx]
-            target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
-            row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
-            probe_tokens[row, pos_idx] = mask_token_id
-            target_mask[row, pos_idx] = True
+            probe_tokens, target_mask = _build_masked_probe_inputs(
+                target_tokens,
+                pos_idx,
+                mask_token_id,
+                window_radius=0,
+            )
             nll, count = _candidate_nll_batch(
                 probe_tokens,
                 target_tokens,
@@ -640,6 +615,7 @@ def compute_contrastive_prompt_utility(
     if pair.numel() == 0:
         return out, out_valid
 
+    probe_window_radius = max(0, int(window_radius)) if reduction == "local_window" else 0
     for start in range(0, pair.shape[0], chunk_size):
         part = pair[start:start + chunk_size]
         if part.numel() == 0:
@@ -647,33 +623,13 @@ def compute_contrastive_prompt_utility(
         b_idx = part[:, 0]
         k_idx = part[:, 1]
         tok_idx = selected_idx[b_idx, k_idx]
-        in_bounds = tok_idx.ge(0) & tok_idx.lt(seq_len)
-        safe_tok_idx = tok_idx.clamp(min=0, max=seq_len - 1)
-
-        probe_tokens = token_ids[b_idx].clone()
         target_tokens = token_ids[b_idx]
-        target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
-        row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
-
-        if reduction == "token":
-            keep = in_bounds & target_tokens[row, safe_tok_idx].ne(mask_token_id)
-            keep_row = row[keep]
-            keep_pos = safe_tok_idx[keep]
-            if keep_row.numel() > 0:
-                probe_tokens[keep_row, keep_pos] = mask_token_id
-                target_mask[keep_row, keep_pos] = True
-        else:
-            radius = max(0, int(window_radius))
-            for offset in range(-radius, radius + 1):
-                pos = tok_idx + int(offset)
-                keep = pos.ge(0) & pos.lt(seq_len)
-                safe_pos = pos.clamp(min=0, max=seq_len - 1)
-                keep = keep & target_tokens[row, safe_pos].ne(mask_token_id)
-                keep_row = row[keep]
-                keep_pos = safe_pos[keep]
-                if keep_row.numel() > 0:
-                    probe_tokens[keep_row, keep_pos] = mask_token_id
-                    target_mask[keep_row, keep_pos] = True
+        probe_tokens, target_mask = _build_masked_probe_inputs(
+            target_tokens,
+            tok_idx,
+            mask_token_id,
+            window_radius=probe_window_radius,
+        )
 
         nll, count = _candidate_nll_batch(
             probe_tokens,
@@ -729,26 +685,26 @@ def compute_counterfactual_regret(
     timesteps,
     selected_idx,
     selected_valid,
-    step_indices=None,
-    sample_aesthetic_score=6.5,
-    counterfactual_chunk_size=64,
-    counterfactual_rollout_steps=1,
-    counterfactual_utility="token_ce",
-    counterfactual_window_radius=0,
-    counterfactual_contrast_negatives=2,
-    counterfactual_contrast_temperature=1.0,
-    counterfactual_contrast_mode="nce",
-    num_sample_steps=16,
-    guidance_scale=12.0,
-    randomize_temperature=1.5,
-    softmax_temperature_annealing=True,
-    refine_softmax_temperature=0.7,
-    guidance_decay="cosine",
-    guidance_decay_scale_pow=1.0,
-    prob_sorting=True,
-    repair_greedy=False,
-    none_condition=None,
-    none_condition_pooled=None,
+    step_indices,
+    sample_aesthetic_score,
+    counterfactual_chunk_size,
+    counterfactual_rollout_steps,
+    counterfactual_utility,
+    counterfactual_window_radius,
+    counterfactual_contrast_negatives,
+    counterfactual_contrast_temperature,
+    counterfactual_contrast_mode,
+    num_sample_steps,
+    guidance_scale,
+    randomize_temperature,
+    softmax_temperature_annealing,
+    refine_softmax_temperature,
+    guidance_decay,
+    guidance_decay_scale_pow,
+    prob_sorting,
+    repair_greedy,
+    none_condition,
+    none_condition_pooled,
 ):
     """Compute counterfactual regret after remasking token i and rolling through plain MaskGen steps.
 
@@ -866,9 +822,9 @@ def compute_counterfactual_regret(
         token_ids=z_t,
         condition=condition,
         condition_pooled=condition_pooled,
-        start_step=start_step,
-        num_sample_steps=num_sample_steps,
-        rollout_steps=counterfactual_rollout_steps,
+        start_step=start_step, # start rollout from the current step to avoid reapplying any critic remasking
+        num_sample_steps=num_sample_steps, # rollout all the way to the end of sampling to capture the full effect of the counterfactual intervention
+        rollout_steps=counterfactual_rollout_steps, #  allow some steps of rollout to let the effect propagate but not so many that the signal is drowned by randomness
         guidance_scale=guidance_scale,
         randomize_temperature=randomize_temperature,
         sample_aesthetic_score=sample_aesthetic_score,
@@ -1215,60 +1171,20 @@ def maskgen_denoise_step(
     condition,
     condition_pooled,
     ratio,
-    guidance_scale=12.0,
-    randomize_temperature=1.5,
-    sample_aesthetic_score=6.5,
-    softmax_temperature_annealing=True,
-    refine_softmax_temperature=0.7,
-    guidance_decay="cosine",
-    guidance_decay_scale_pow=1.0,
-    prob_sorting=True,
-    repair_greedy=False,
-    none_condition=None,
-    none_condition_pooled=None,
-    final_step=False,
+    guidance_scale,
+    randomize_temperature,
+    sample_aesthetic_score,
+    softmax_temperature_annealing,
+    refine_softmax_temperature,
+    guidance_decay,
+    guidance_decay_scale_pow,
+    prob_sorting,
+    repair_greedy,
+    none_condition,
+    none_condition_pooled,
+    final_step,
 ):
     """Run one MaskGen denoising step and return the next partially masked state."""
-    debug_denoise = os.environ.get("TOKEN_REGRET_DEBUG_DENOISE", "0").lower() in {"1", "true", "yes", "on"}
-    debug_rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-
-    def _debug_tensor(name, value):
-        if not debug_denoise or debug_rank != 0:
-            return
-        t = value.detach()
-        if t.numel() == 0:
-            print(f"[denoise-debug rank={debug_rank}] {name}: empty shape={tuple(t.shape)} dtype={t.dtype}")
-            return
-        if torch.is_floating_point(t):
-            finite = torch.isfinite(t)
-            finite_count = int(finite.sum().item())
-            nan_count = int(torch.isnan(t).sum().item())
-            inf_count = int(torch.isinf(t).sum().item())
-            if finite_count > 0:
-                finite_t = t[finite].float()
-                print(
-                    f"[denoise-debug rank={debug_rank}] {name}: "
-                    f"shape={tuple(t.shape)} dtype={t.dtype} finite={finite_count}/{t.numel()} "
-                    f"nan={nan_count} inf={inf_count} "
-                    f"min={finite_t.min().item():.6g} max={finite_t.max().item():.6g} "
-                    f"mean={finite_t.mean().item():.6g} std={finite_t.std(unbiased=False).item():.6g}"
-                )
-            else:
-                print(
-                    f"[denoise-debug rank={debug_rank}] {name}: "
-                    f"shape={tuple(t.shape)} dtype={t.dtype} finite=0/{t.numel()} "
-                    f"nan={nan_count} inf={inf_count}"
-                )
-            return
-
-        unique_vals, unique_counts = torch.unique(t, return_counts=True)
-        preview = list(zip(unique_vals[:8].tolist(), unique_counts[:8].tolist()))
-        print(
-            f"[denoise-debug rank={debug_rank}] {name}: "
-            f"shape={tuple(t.shape)} dtype={t.dtype} unique_count={unique_vals.numel()} "
-            f"preview={preview}"
-        )
-
     annealed_temp = float(randomize_temperature) * (1.0 - ratio)
     mask_token_id = int(model.mask_token_id)
     is_mask = token_ids.eq(mask_token_id)
@@ -1285,15 +1201,6 @@ def maskgen_denoise_step(
         none_condition=none_condition,
         none_condition_pooled=none_condition_pooled,
     )
-    _debug_tensor("condition", condition)
-    _debug_tensor("condition_pooled", condition_pooled)
-    if none_condition is not None:
-        _debug_tensor("none_condition", none_condition)
-    if none_condition_pooled is not None:
-        _debug_tensor("none_condition_pooled", none_condition_pooled)
-    _debug_tensor("input_token_ids", token_ids)
-    _debug_tensor("is_mask", is_mask)
-    _debug_tensor("raw_logits", logits)
 
     if bool(softmax_temperature_annealing):
         softmax_temperature = 0.5 + 0.8 * (1.0 - ratio)
@@ -1302,21 +1209,17 @@ def maskgen_denoise_step(
     logits_for_sample = logits / float(softmax_temperature)
     if 0 <= mask_token_id < logits_for_sample.shape[-1]:
         logits_for_sample[..., mask_token_id] = -1e9
-    _debug_tensor("logits_for_sample", logits_for_sample)
 
     noisy_logits = None
     if bool(repair_greedy):
         proposed_ids = logits_for_sample.argmax(dim=-1)
     else:
         noisy_logits = _add_gumbel_noise(logits_for_sample, annealed_temp)
-        _debug_tensor("noisy_logits", noisy_logits)
         proposed_ids = noisy_logits.argmax(dim=-1)
 
     proposed_logits = logits_for_sample.gather(dim=-1, index=proposed_ids.unsqueeze(-1)).squeeze(-1)
     sampled_ids = torch.where(is_mask, proposed_ids, token_ids)
-    _debug_tensor("proposed_ids", proposed_ids)
-    _debug_tensor("proposed_logits", proposed_logits)
-    _debug_tensor("sampled_ids", sampled_ids)
+    
     if bool(final_step):
         return sampled_ids
 
@@ -1342,30 +1245,10 @@ def maskgen_denoise_step(
     confidence = sampled_logits
     if bool(prob_sorting) and not bool(repair_greedy):
         confidence = _add_gumbel_noise(confidence, annealed_temp)
-    _debug_tensor("sampled_logits", sampled_logits)
-    _debug_tensor("confidence", confidence)
     sorted_confidence, _ = torch.sort(confidence, dim=-1)
     safe_k = mask_len.clamp(min=1)
     cut_off = sorted_confidence.gather(dim=-1, index=(safe_k - 1).unsqueeze(-1))
     masking = (confidence <= cut_off) & mask_len.unsqueeze(-1).gt(0)
-    _debug_tensor("sorted_confidence", sorted_confidence)
-    _debug_tensor("cut_off", cut_off)
-    _debug_tensor("masking", masking)
-    if debug_denoise and debug_rank == 0:
-        print(
-            f"[denoise-debug rank={debug_rank}] "
-            f"ratio={float(ratio):.6g} annealed_temp={annealed_temp:.6g} "
-            f"softmax_temperature={float(softmax_temperature):.6g} "
-            f"repair_greedy={bool(repair_greedy)} prob_sorting={bool(prob_sorting)} "
-            f"final_step={bool(final_step)} mask_token_id={mask_token_id}"
-        )
-        print(
-            f"[denoise-debug rank={debug_rank}] "
-            f"remaining_masks={remaining_masks[:4].tolist()} "
-            f"schedule_mask_len={schedule_mask_len[:4].tolist()} "
-            f"mask_len={mask_len[:4].tolist()} "
-            f"masking_count={int(masking.sum().item())}"
-        )
 
     return torch.where(masking, mask_token_id, sampled_ids)
 
@@ -1425,7 +1308,7 @@ def _critic_prompt_gap_topk(critic):
     if critic is None:
         return 0
     module = critic.module if isinstance(critic, DDP) else critic
-    return max(0, int(getattr(module, "prompt_gap_topk", 0)))
+    return max(0, int(module.prompt_gap_topk))
 
 
 @torch.no_grad()
@@ -1537,23 +1420,19 @@ def build_rollout_state(
     none_condition_pooled,
     device,
     batch_size,
-    guidance_scale=12.0,
-    randomize_temperature=1.5,
-    sample_aesthetic_score=6.5,
-    num_sample_steps=16,
-    softmax_temperature_annealing=True,
-    refine_softmax_temperature=0.7,
-    guidance_decay="cosine",
-    guidance_decay_scale_pow=1.0,
-    prob_sorting=True,
-    repair_greedy=False,
-    refine_loops=1,
-    refine_start_step=10,
-    critic=None,
-    remask_ratio=0.05,
-    remask_min_score=0.0,
-    critic_use_hidden=True,
-    fixed_step=None,
+    guidance_scale,
+    randomize_temperature,
+    sample_aesthetic_score,
+    num_sample_steps,
+    refine_softmax_temperature,
+    guidance_decay,
+    guidance_decay_scale_pow,
+    prob_sorting,
+    repair_greedy,
+    refine_loops,
+    refine_start_step,
+    fixed_step,
+    softmax_temperature_annealing=False,
 ):
     """
      creates a realistic partially denoised MaskGen token sequence at a randomly chosen refinement timestep, 
@@ -1563,9 +1442,6 @@ def build_rollout_state(
     1) choose a refinement timestep
     2) simulate the inference policy from the all-mask state up to that timestep
     3) return the current partially masked token state before the critic action
-
-    If `critic` is provided, it should be a frozen rollout policy such as an EMA
-    target critic, not the train critic currently receiving gradients.
     """
     assert guidance_decay in ["linear", "cosine", "none", "flippedcosine"]
     
@@ -1583,26 +1459,6 @@ def build_rollout_state(
     ids = torch.full((batch_size, int(model.image_seq_len)), int(model.mask_token_id), device=device)
     for prev_step in range(step):
         prev_ratio = float(prev_step + 1) / float(num_sample_steps)
-        critic_guided_step = critic is not None and int(refine_start_step) <= prev_step < refine_end_step
-        if critic_guided_step:
-            critic_budget = _resolve_schedule_remask_count(model, prev_ratio, budget_fraction=remask_ratio)
-            ids = critic_remask_tokens(
-                model=model,
-                critic=critic,
-                token_ids=ids,
-                condition=condition,
-                condition_pooled=condition_pooled,
-                ratio=prev_ratio,
-                guidance_scale=guidance_scale,
-                sample_aesthetic_score=sample_aesthetic_score,
-                remask_ratio=critic_budget,
-                remask_min_score=remask_min_score,
-                critic_use_hidden=critic_use_hidden,
-                guidance_decay=guidance_decay,
-                guidance_decay_scale_pow=guidance_decay_scale_pow,
-                none_condition=none_condition,
-                none_condition_pooled=none_condition_pooled,
-            )
         ids = maskgen_denoise_step(
             model=model,
             token_ids=ids,
@@ -1657,9 +1513,9 @@ def generate_wrapper(
     if bool(use_critic_head) and critic is None:
         raise ValueError("use_critic_head=True requires a non-None critic.")
 
-    sample_aesthetic_score = float(
-        getattr(model, "sample_aesthetic_score", 6.5) if sample_aesthetic_score is None else sample_aesthetic_score
-    )
+    if sample_aesthetic_score is None:
+        sample_aesthetic_score = 6.5
+    sample_aesthetic_score = float(sample_aesthetic_score)
 
     condition, condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, captions)
     none_cond, none_cond_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, [""])
@@ -1897,138 +1753,9 @@ def _merge_fixed_training_subset_manifests(output_dir, world_size):
     return merged_manifest_path, len(rows)
 
 
-def apply_cli_overrides(config):
-    """Apply notebook/script command-line overrides to the default ConfigDict."""
-    parser = argparse.ArgumentParser(description="Train the token-regret critic.", add_help=True)
-    parser.add_argument("--num-epochs", type=int)
-    parser.add_argument("--max-steps", type=int)
-    parser.add_argument("--max-train-images", type=int)
-    parser.add_argument("--per-gpu-batch-size", type=int)
-    parser.add_argument("--learning-rate", type=float)
-    parser.add_argument("--counterfactual-chunk-size", type=int)
-    parser.add_argument("--counterfactual-rollout-steps", type=int)
-    parser.add_argument("--counterfactual-utility", type=str)
-    parser.add_argument("--counterfactual-window-radius", type=int)
-    parser.add_argument("--counterfactual-contrast-negatives", type=int)
-    parser.add_argument("--counterfactual-contrast-temperature", type=float)
-    parser.add_argument("--counterfactual-contrast-mode", type=str)
-    parser.add_argument("--counterfactual-repair-greedy", action="store_true", default=None)
-    parser.add_argument(
-        "--no-counterfactual-repair-greedy",
-        action="store_false",
-        dest="counterfactual_repair_greedy",
-        default=None,
-    )
-    parser.add_argument("--critic-prompt-gap-topk", type=int)
-    parser.add_argument("--regret-target-transform", type=str)
-    parser.add_argument("--target-critic-ema-decay", type=float)
-    parser.add_argument("--fixed-rollout-step", type=int)
-    parser.add_argument("--use-target-critic-replay", action="store_true", default=None)
-    parser.add_argument(
-        "--no-target-critic-replay",
-        action="store_false",
-        dest="use_target_critic_replay",
-        default=None,
-    )
-    parser.add_argument("--train-repair-greedy", action="store_true", default=None)
-    parser.add_argument(
-        "--no-train-repair-greedy",
-        action="store_false",
-        dest="train_repair_greedy",
-        default=None,
-    )
-    parser.add_argument("--lambda-rank", type=float)
-    parser.add_argument("--rank-margin", type=float)
-    parser.add_argument("--rank-gap-threshold", type=float)
-    parser.add_argument("--train-remask-ratio", type=float)
-    parser.add_argument("--remask-min-score", type=float)
-    parser.add_argument("--train-refine-start-step", type=int)
-    parser.add_argument("--refine-loops", type=int)
-    parser.add_argument("--save-every", type=int)
-    parser.add_argument("--log-every", type=int)
-    parser.add_argument("--seed", type=int)
-    parser.add_argument("--output-dir", type=str)
-    parser.add_argument("--resume-checkpoint", type=str)
-    parser.add_argument("--train-data-source", type=str)
-    parser.add_argument("--train-dataset-mode", type=str)
-    parser.add_argument("--cc12m-cache-dir", type=str)
-    parser.add_argument("--disable-cc12m-cache", action="store_true", default=None)
-    parser.add_argument("--stream-prefetch-batches", type=int)
-    parser.add_argument("--cc12m-loader-workers", type=int)
-    parser.add_argument("--cc12m-loader-max-pending", type=int)
-    args, unknown = parser.parse_known_args()
-
-    if unknown and is_main_process():
-        print(f"WARNING: ignoring unknown training arguments: {' '.join(unknown)}", file=sys.stderr)
-
-    training = config.training
-    dataset_cfg = config.dataset
-    if os.environ.get("DIST_BACKEND"):
-        training.dist_backend = str(os.environ["DIST_BACKEND"])
-
-    assignments = [
-        (training, "num_epochs", args.num_epochs),
-        (training, "max_steps", args.max_steps),
-        (training, "max_train_images", args.max_train_images),
-        (training, "per_gpu_batch_size", args.per_gpu_batch_size),
-        (training, "learning_rate", args.learning_rate),
-        (training, "counterfactual_chunk_size", args.counterfactual_chunk_size),
-        (training, "counterfactual_rollout_steps", args.counterfactual_rollout_steps),
-        (training, "counterfactual_utility", args.counterfactual_utility),
-        (training, "counterfactual_window_radius", args.counterfactual_window_radius),
-        (training, "counterfactual_contrast_negatives", args.counterfactual_contrast_negatives),
-        (training, "counterfactual_contrast_temperature", args.counterfactual_contrast_temperature),
-        (training, "counterfactual_contrast_mode", args.counterfactual_contrast_mode),
-        (training, "counterfactual_repair_greedy", args.counterfactual_repair_greedy),
-        (training, "critic_prompt_gap_topk", args.critic_prompt_gap_topk),
-        (training, "regret_target_transform", args.regret_target_transform),
-        (training, "target_critic_ema_decay", args.target_critic_ema_decay),
-        (training, "fixed_rollout_step", args.fixed_rollout_step),
-        (training, "use_target_critic_replay", args.use_target_critic_replay),
-        (training, "train_repair_greedy", args.train_repair_greedy),
-        (training, "lambda_rank", args.lambda_rank),
-        (training, "rank_margin", args.rank_margin),
-        (training, "rank_gap_threshold", args.rank_gap_threshold),
-        (training, "train_remask_ratio", args.train_remask_ratio),
-        (config.inference, "remask_ratio", args.train_remask_ratio),
-        (config.inference, "remask_min_score", args.remask_min_score),
-        (training, "train_refine_start_step", args.train_refine_start_step),
-        (config.inference, "refine_start_step", args.train_refine_start_step),
-        (training, "refine_loops", args.refine_loops),
-        (config.inference, "refine_loops", args.refine_loops),
-        (training, "save_every", args.save_every),
-        (training, "log_every", args.log_every),
-        (training, "seed", args.seed),
-        (config.inference, "seed", args.seed),
-        (config.runtime, "resume_checkpoint", args.resume_checkpoint),
-        (dataset_cfg, "source", args.train_data_source),
-        (dataset_cfg, "mode", args.train_dataset_mode),
-        (dataset_cfg, "cc12m_cache_dir", args.cc12m_cache_dir),
-        (dataset_cfg, "stream_prefetch_batches", args.stream_prefetch_batches),
-        (dataset_cfg, "cc12m_loader_workers", args.cc12m_loader_workers),
-        (dataset_cfg, "cc12m_loader_max_pending", args.cc12m_loader_max_pending),
-    ]
-    for section, key, value in assignments:
-        if value is not None:
-            section[key] = value
-
-    if args.disable_cc12m_cache is not None:
-        dataset_cfg.disable_cc12m_cache = bool(args.disable_cc12m_cache)
-
-    if args.output_dir:
-        output_dir = str(args.output_dir)
-        config.experiment.output_dir = output_dir
-        config.experiment.logging_dir = os.path.join(output_dir, "logs")
-        config.logging.tensorboard_dir = os.path.join(output_dir, "logs", "tb")
-        config.logging.metrics_path = os.path.join(output_dir, "logs", "metrics.jsonl")
-
-    return config
-
-
 def main():
     """Entry point for distributed token-regret critic training."""
     config = get_config()
-    config = apply_cli_overrides(config)
     training = config.training
     dataset_cfg = config.dataset
     model_cfg = config.model
@@ -2055,11 +1782,10 @@ def main():
     clip_encoder.eval().requires_grad_(False)
     clip_tokenizer = open_clip.get_tokenizer("ViT-L-14-336")
 
-    critic_prompt_gap_topk = max(0, int(getattr(training, "critic_prompt_gap_topk", 8)))
-    critic = build_token_regret_critic(
+    critic = initialize_token_regret_critic_model(
         model,
         use_hidden=True,
-        prompt_gap_topk=critic_prompt_gap_topk,
+        prompt_gap_topk=training.critic_prompt_gap_topk,
     ).to(device)
 
     use_ddp = world_size > 1 and device.type == "cuda"
@@ -2067,13 +1793,13 @@ def main():
         critic = DDP(critic, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
 
     optimizer = torch.optim.AdamW(critic.parameters(), lr=float(training.learning_rate), weight_decay=1e-4)
-    target_critic = build_token_regret_critic(
+    target_critic = initialize_token_regret_critic_model(
         model,
         use_hidden=True,
-        prompt_gap_topk=critic_prompt_gap_topk,
+        prompt_gap_topk=training.critic_prompt_gap_topk,
     ).to(device)
     copy_critic_weights_(target_critic, critic)
-    target_ema_decay = max(0.0, min(1.0, float(getattr(training, "target_critic_ema_decay", 0.995))))
+    target_ema_decay = float(training.target_critic_ema_decay)
 
     start_step = 0
     resume_path = str(config.runtime.resume_checkpoint).strip()
@@ -2122,12 +1848,6 @@ def main():
     )
     if is_main_process():
         print(f"Dataset pipeline: {dataset_pipeline.describe()}")
-        if dataset_pipeline.use_cc12m:
-            print(
-                "CC12M image cache: "
-                f"{'disabled' if not dataset_pipeline.cc12m_cache_enabled else dataset_pipeline.cc12m_cache_dir}"
-            )
-            print(f"CC12M loader workers: {int(dataset_pipeline.cc12m_loader_workers)}")
 
     dataset_examples = dataset_pipeline.infer_total_examples()
     steps_per_epoch = None
@@ -2135,11 +1855,11 @@ def main():
         steps_per_epoch = max(1, math.ceil(int(dataset_examples) / (int(training.per_gpu_batch_size) * max(world_size, 1))))
 
     total_steps = None if steps_per_epoch is None else int(steps_per_epoch) * int(training.num_epochs)
-    max_steps = int(getattr(training, "max_steps", 0))
+    max_steps = int(training.max_steps)
     stop_step = int(start_step) + max_steps if max_steps > 0 else None
     if stop_step is not None:
         total_steps = stop_step
-    max_train_images = max(0, int(getattr(training, "max_train_images", 0)))
+    max_train_images = max(0, int(training.max_train_images))
     max_train_images_per_rank = 0
     fixed_subset_images = None
     fixed_subset_captions = None
@@ -2197,11 +1917,8 @@ def main():
     step = int(start_step)
 
     cfg = config.to_dict()
-    train_repair_greedy = bool(
-        getattr(training, "train_repair_greedy", getattr(training, "counterfactual_repair_greedy", config.inference.repair_greedy))
-    )
-    use_target_critic_replay = bool(getattr(training, "use_target_critic_replay", True))
-    fixed_rollout_step = int(getattr(training, "fixed_rollout_step", -1))
+    train_repair_greedy = bool(training.train_repair_greedy)
+    fixed_rollout_step = int(training.fixed_rollout_step)
     fixed_rollout_step_arg = fixed_rollout_step if fixed_rollout_step >= 0 else None
     tb_logger = None
     if is_main_process() and bool(logging_cfg.enabled):
@@ -2238,7 +1955,6 @@ def main():
             if batch_size <= 0:
                 continue
             gt_tokens = images_to_tokens(tokenizer, images).to(device, non_blocking=True)
-            train_aes = float(training.train_aesthetic_score)
 
             with torch.no_grad():
                 # Match inference-side text conditioning (no training-time text dropout).
@@ -2250,6 +1966,8 @@ def main():
                 none_condition = none_condition.repeat(batch_size, 1, 1).to(device, non_blocking=True)
                 none_condition_pooled = none_condition_pooled.repeat(batch_size, 1, 1).to(device, non_blocking=True)
 
+                # Build the partially denoised token state for the current training step, 
+                # by simulating forward from the all-mask state up to a random refinement step.
                 z_t, timesteps, rollout_step_indices = build_rollout_state(
                     model=model,
                     condition=condition,
@@ -2262,20 +1980,19 @@ def main():
                     randomize_temperature=float(training.train_randomize_temperature),
                     sample_aesthetic_score=float(training.train_aesthetic_score),
                     num_sample_steps=int(model_cfg.sample_steps),
-                    refine_softmax_temperature=0.7,
                     refine_loops=int(training.refine_loops),
                     refine_start_step=int(training.train_refine_start_step),
                     repair_greedy=train_repair_greedy,
-                    # For normal policy training, replay uses the frozen EMA policy. For overfit sanity
-                    # checks, disable this so the same images produce stable state distributions.
-                    critic=target_critic if use_target_critic_replay else None,
-                    remask_ratio=float(training.train_remask_ratio),
-                    remask_min_score=float(getattr(config.inference, "remask_min_score", 0.0)),
-                    critic_use_hidden=True,
                     fixed_step=fixed_rollout_step_arg,
+                    refine_softmax_temperature=0.7,
+                    guidance_decay="cosine",
+                    guidance_decay_scale_pow=1.0,
+                    prob_sorting=True,
                 )
 
-                use_prompt_gap_features = _critic_prompt_gap_topk(critic) > 0
+                # This is a per-token, per-vocab “how much did the prompt change the model’s preference?” tensor.
+                # prompt_logits_delta_orig tells the critic which predictions are specifically supported by the prompt, rather than just being generic image priors.
+                use_prompt_gap_features = training.critic_prompt_gap_topk  > 0
                 if use_prompt_gap_features:
                     logits_orig, hidden_orig, text_feat, cond_logits_orig, uncond_logits_orig = forward_maskgen(
                         model=model,
@@ -2284,16 +2001,14 @@ def main():
                         condition_pooled=condition_pooled,
                         ratio=timesteps,
                         guidance_scale=float(training.train_guidance_scale),
-                        sample_aesthetic_score=train_aes,
+                        sample_aesthetic_score=float(training.train_aesthetic_score),
                         guidance_decay="cosine",
                         guidance_decay_scale_pow=1.0,
                         none_condition=none_condition,
                         none_condition_pooled=none_condition_pooled,
                         return_cfg_parts=True,
                     )
-                    prompt_logits_delta_orig = (
-                        cond_logits_orig - uncond_logits_orig if uncond_logits_orig is not None else None
-                    )
+                    prompt_logits_delta_orig = (cond_logits_orig - uncond_logits_orig if uncond_logits_orig is not None else None)
                 else:
                     # Compute the original logits used by the critic at the current decision state.
                     logits_orig, hidden_orig, text_feat = forward_maskgen(
@@ -2303,14 +2018,15 @@ def main():
                         condition_pooled=condition_pooled,
                         ratio=timesteps,
                         guidance_scale=float(training.train_guidance_scale),
-                        sample_aesthetic_score=train_aes,
+                        sample_aesthetic_score=float(training.train_aesthetic_score),
                         guidance_decay="cosine",
                         guidance_decay_scale_pow=1.0,
                         none_condition=none_condition,
                         none_condition_pooled=none_condition_pooled,
                     )
                     prompt_logits_delta_orig = None
-
+                # The critic only needs to learn to predict regret for tokens that are actually visible (not masked) at this step, 
+                # since those are the only ones it can change in the next step. So we compute counterfactual regrets only for the visible tokens, and use those as targets to train the critic.
                 base_candidate_mask = z_t.ne(int(model.mask_token_id))
                 selected_idx, selected_valid = select_all_token_positions(base_candidate_mask)
                 
@@ -2324,21 +2040,23 @@ def main():
                     step_indices=rollout_step_indices,
                     selected_idx=selected_idx,
                     selected_valid=selected_valid,
-                    sample_aesthetic_score=train_aes,
+                    sample_aesthetic_score=float(training.train_aesthetic_score),
                     counterfactual_chunk_size=int(training.counterfactual_chunk_size),
-                    counterfactual_rollout_steps=int(getattr(training, "counterfactual_rollout_steps", 1)),
-                    counterfactual_utility=str(getattr(training, "counterfactual_utility", "token_ce")),
-                    counterfactual_window_radius=int(getattr(training, "counterfactual_window_radius", 0)),
-                    counterfactual_contrast_negatives=int(getattr(training, "counterfactual_contrast_negatives", 2)),
-                    counterfactual_contrast_temperature=float(getattr(training, "counterfactual_contrast_temperature", 1.0)),
-                    counterfactual_contrast_mode=str(getattr(training, "counterfactual_contrast_mode", "nce")),
+                    counterfactual_rollout_steps=int(training.counterfactual_rollout_steps),
+                    counterfactual_utility=str(training.counterfactual_utility),
+                    counterfactual_window_radius=int(training.counterfactual_window_radius),
+                    counterfactual_contrast_negatives=int(training.counterfactual_contrast_negatives),
+                    counterfactual_contrast_temperature=float(training.counterfactual_contrast_temperature),
+                    counterfactual_contrast_mode=str(training.counterfactual_contrast_mode),
                     num_sample_steps=int(model_cfg.sample_steps),
                     guidance_scale=float(training.train_guidance_scale),
                     randomize_temperature=float(training.train_randomize_temperature),
                     refine_softmax_temperature=0.7,
                     guidance_decay="cosine",
                     guidance_decay_scale_pow=1.0,
-                    repair_greedy=bool(getattr(training, "counterfactual_repair_greedy", config.inference.repair_greedy)),
+                    softmax_temperature_annealing=False,
+                    prob_sorting=True,
+                    repair_greedy=bool(training.counterfactual_repair_greedy),
                     none_condition=none_condition,
                     none_condition_pooled=none_condition_pooled,
                 )
@@ -2353,7 +2071,7 @@ def main():
             pred_sel = pred_regret.gather(dim=-1, index=selected_idx)
             targets = transform_regret_targets(
                 counterfactual_regrets,
-                transform=getattr(training, "regret_target_transform", "tanh"),
+                transform=str(training.regret_target_transform),
                 valid_mask=selected_valid,
             )
             valid_float = selected_valid.float()
@@ -2379,11 +2097,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if training.grad_clip_norm > 0.0:
-                grad_norm = torch.tensor(0.0, device=pred_sel.device)
-                grad_norm = torch.as_tensor(
-                    torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=training.grad_clip_norm),
-                    device=pred_sel.device,
-                )
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=training.grad_clip_norm)
             optimizer.step()
             update_ema_critic_(target_critic, critic, target_ema_decay)
 
@@ -2472,15 +2186,14 @@ def main():
                             "train/pred_visible_mean": visible_pred_mean,
                             "train/pred_masked_mean": masked_pred_mean,
                             "train/target_critic_ema_decay": target_ema_decay,
-                            "train/use_target_critic_replay": int(use_target_critic_replay),
                             "train/fixed_rollout_step": fixed_rollout_step,
                             "train/train_repair_greedy": int(train_repair_greedy),
                             "train/train_randomize_temperature": float(training.train_randomize_temperature),
-                            "train/counterfactual_rollout_steps": int(getattr(training, "counterfactual_rollout_steps", 1)),
-                            "train/counterfactual_window_radius": int(getattr(training, "counterfactual_window_radius", 0)),
-                            "train/counterfactual_contrast_negatives": int(getattr(training, "counterfactual_contrast_negatives", 2)),
-                            "train/counterfactual_contrast_temperature": float(getattr(training, "counterfactual_contrast_temperature", 1.0)),
-                            "train/counterfactual_repair_greedy": int(bool(getattr(training, "counterfactual_repair_greedy", False))),
+                            "train/counterfactual_rollout_steps": int(training.counterfactual_rollout_steps),
+                            "train/counterfactual_window_radius": int(training.counterfactual_window_radius),
+                            "train/counterfactual_contrast_negatives": int(training.counterfactual_contrast_negatives),
+                            "train/counterfactual_contrast_temperature": float(training.counterfactual_contrast_temperature),
+                            "train/counterfactual_repair_greedy": int(bool(training.counterfactual_repair_greedy)),
                             "train/selected_count": selected_count,
                             "train/selected_fraction": selected_frac,
                             "train/timestep_mean": float(timesteps.mean().item()),

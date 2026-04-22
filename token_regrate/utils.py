@@ -256,7 +256,7 @@ def load_critic_checkpoint(path, critic, optimizer=None, map_location="cpu", tar
     return ckpt
 
 
-def build_token_regret_critic(model, use_hidden=True, prompt_gap_topk=8):
+def initialize_token_regret_critic_model(model, use_hidden=True, prompt_gap_topk=8):
     """Construct a TokenRegretCritic using generator embedding dimensions."""
     hidden_dim = int(model.pos_embed.shape[-1])
     text_dim = int(model.pos_embed.shape[-1])
@@ -271,7 +271,7 @@ def build_token_regret_critic(model, use_hidden=True, prompt_gap_topk=8):
 def load_trained_critic(ckpt_path, model, use_hidden=True, prompt_gap_topk=8):
     """Build and load a frozen critic module on the model device."""
     target_device = next(model.parameters()).device
-    critic = build_token_regret_critic(
+    critic = initialize_token_regret_critic_model(
         model,
         use_hidden=use_hidden,
         prompt_gap_topk=max(0, int(prompt_gap_topk)),

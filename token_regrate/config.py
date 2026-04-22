@@ -2,7 +2,7 @@ from ml_collections import config_dict
 import os
 
 # Unified output directory for this config module.
-OUTPUT_DIR = "outputs/token_regret_critic_overfit4"
+OUTPUT_DIR = "outputs/token_regret_critic_new"
 
 
 def get_config():
@@ -34,7 +34,9 @@ def get_config():
     config.training.counterfactual_chunk_size = 512
     # Number of plain MaskGen denoise steps rolled forward after each token-remask counterfactual.
     config.training.counterfactual_rollout_steps = -1
-    # Utility used to score baseline-vs-counterfactual quality; supports CE, cond-vs-uncond, and matched-vs-mismatched prompt variants.
+    # Utility used to score baseline-vs-counterfactual quality; use one of:
+    # token_ce, local_window_ce, full_sequence_ce, token_prompt, local_window_prompt,
+    # full_sequence_prompt, token_contrast, local_window_contrast, full_sequence_contrast.
     config.training.counterfactual_utility = "local_window_contrast"
     # Extra neighboring token radius included around the tested token for local-window utilities; 0 = token only.
     config.training.counterfactual_window_radius = 6
@@ -68,8 +70,6 @@ def get_config():
     config.training.train_repair_greedy = True
     # Fixed critic decision step for every training example; negative would sample uniformly over refine steps.
     config.training.fixed_rollout_step = -1
-    # Replay earlier guided steps with the frozen EMA target critic when building training states.
-    config.training.use_target_critic_replay = False
     # Max gradient norm for critic parameters; <=0 disables gradient clipping.
     config.training.grad_clip_norm = 1.0
     # Weight on the auxiliary pairwise ranking loss; 0 trains only the MSE regret regression loss.
