@@ -99,6 +99,27 @@ def select_all_token_positions(candidate_mask):
     idx = torch.arange(seq_len, device=candidate_mask.device).unsqueeze(0).expand(bsz, -1)
     return idx, candidate_mask.bool()
 
+def select_budget_token_positions(candidate_mask, budget_count, multiplier=1.0, min_tokens=1):
+    """Randomly sample a budget-tied subset of valid token positions per example."""
+    if candidate_mask.dtype != torch.bool:
+        candidate_mask = candidate_mask.bool()
+    bsz, seq_len = candidate_mask.shape
+    candidate_count = _resolve_num_selected(
+        seq_len,
+        max(0.0, float(budget_count)) * max(0.0, float(multiplier)),
+        min_tokens=min_tokens,
+    )
+    if candidate_count == 0:
+        empty_idx = torch.zeros(bsz, 0, dtype=torch.long, device=candidate_mask.device)
+        empty_valid = torch.zeros(bsz, 0, dtype=torch.bool, device=candidate_mask.device)
+        return empty_idx, empty_valid
+
+    random_scores = torch.rand((bsz, seq_len), device=candidate_mask.device, dtype=torch.float32)
+    random_scores = random_scores.masked_fill(~candidate_mask, float("-inf"))
+    idx = random_scores.topk(k=candidate_count, dim=-1).indices
+    valid = candidate_mask.gather(dim=-1, index=idx)
+    return idx, valid
+
 
 def prepare_text_guidance(text, clip_tokenizer, clip_encoder, device):
     """Encode prompts with CLIP text tower for tokenizer decode guidance."""
@@ -282,6 +303,28 @@ def _masked_token_nll(logits, target_tokens, valid_mask):
     return token_nll, valid_mask
 
 
+def _masked_mean_token_nll(logits, target_tokens, valid_mask):
+    """Compute per-row mean token NLL at valid positions without materializing a dense token map."""
+    if valid_mask is None:
+        valid_mask = torch.ones_like(target_tokens, dtype=torch.bool)
+    valid_mask = valid_mask.bool() & target_tokens.ge(0) & target_tokens.lt(logits.shape[-1])
+    row_count = target_tokens.shape[0]
+    nll_sum = torch.zeros((row_count,), dtype=logits.dtype, device=logits.device)
+    count = torch.zeros((row_count,), dtype=logits.dtype, device=logits.device)
+    if not bool(valid_mask.any()):
+        return nll_sum, count
+
+    flat_mask = valid_mask.reshape(-1)
+    flat_logits = logits.reshape(-1, logits.shape[-1])[flat_mask]
+    flat_targets = target_tokens.reshape(-1)[flat_mask]
+    flat_nll = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+    row_idx = torch.arange(row_count, device=target_tokens.device).unsqueeze(-1).expand_as(target_tokens)
+    row_idx = row_idx.reshape(-1)[flat_mask]
+    nll_sum.scatter_add_(0, row_idx, flat_nll)
+    count.scatter_add_(0, row_idx, torch.ones_like(flat_nll, dtype=logits.dtype))
+    return nll_sum / count.clamp(min=1.0), count
+
+
 def _build_masked_probe_inputs(target_tokens, token_positions, mask_token_id, window_radius=0):
     """Build per-row masked probe inputs for token or local-window prompt utilities."""
     probe_tokens = target_tokens.clone()
@@ -348,7 +391,7 @@ def compute_prompt_delta_nll(
     probe_window_radius = max(0, int(window_radius)) if reduction == "local_window" else 0
 
     def _score_probe_batch(probe_tokens, target_tokens, target_mask, cond, cond_pooled, uncond, uncond_pooled):
-        cond_logits, _, _ = forward_maskgen(
+        _, _, _, cond_logits, uncond_logits = forward_maskgen(
             model=model,
             input_ids=probe_tokens,
             condition=cond,
@@ -358,17 +401,9 @@ def compute_prompt_delta_nll(
             sample_aesthetic_score=sample_aesthetic_score,
             guidance_decay=guidance_decay,
             guidance_decay_scale_pow=guidance_decay_scale_pow,
-        )
-        uncond_logits, _, _ = forward_maskgen(
-            model=model,
-            input_ids=probe_tokens,
-            condition=uncond,
-            condition_pooled=uncond_pooled,
-            ratio=ratio,
-            guidance_scale=guidance_scale,
-            sample_aesthetic_score=sample_aesthetic_score,
-            guidance_decay=guidance_decay,
-            guidance_decay_scale_pow=guidance_decay_scale_pow,
+            none_condition=uncond,
+            none_condition_pooled=uncond_pooled,
+            return_cfg_parts=True,
         )
         target_mask = target_mask.bool() & target_tokens.ne(mask_token_id)
         cond_nll, target_mask = _masked_token_nll(cond_logits, target_tokens, valid_mask=target_mask)
@@ -565,11 +600,9 @@ def compute_contrastive_prompt_utility(
             guidance_decay_scale_pow=guidance_decay_scale_pow,
         )
         mask_all = mask_all.bool() & target_all.ne(mask_token_id)
-        token_nll, mask_all = _masked_token_nll(logits, target_all, valid_mask=mask_all)
-        token_nll = token_nll.reshape(row_count, candidate_count, -1)
-        mask_all = mask_all.reshape(row_count, candidate_count, -1)
-        count = mask_all.to(dtype=token_nll.dtype).sum(dim=-1)
-        nll = (token_nll * mask_all.to(dtype=token_nll.dtype)).sum(dim=-1) / count.clamp(min=1.0)
+        nll, count = _masked_mean_token_nll(logits, target_all, valid_mask=mask_all)
+        nll = nll.reshape(row_count, candidate_count)
+        count = count.reshape(row_count, candidate_count)
         return nll, count[:, 0]
 
     if reduction == "full_sequence":
@@ -690,7 +723,6 @@ def compute_counterfactual_regret(
     counterfactual_chunk_size,
     counterfactual_rollout_steps,
     counterfactual_utility,
-    counterfactual_window_radius,
     counterfactual_contrast_negatives,
     counterfactual_contrast_temperature,
     counterfactual_contrast_mode,
@@ -800,12 +832,12 @@ def compute_counterfactual_regret(
 
     utility_name = _canonical_counterfactual_utility(counterfactual_utility)
     utility_family = _counterfactual_utility_family(utility_name)
-    window_radius = max(0, int(counterfactual_window_radius))
+    window_radius = 0
     start_step = int(step_indices[0].item())
     _debug(
         f"start_step={start_step} num_sample_steps={int(num_sample_steps)} "
         f"rollout_steps={int(counterfactual_rollout_steps)} chunk_size={int(counterfactual_chunk_size)} "
-        f"utility={utility_name} window_radius={window_radius} "
+        f"utility={utility_name} token_only={True} "
         f"contrast_negatives={int(counterfactual_contrast_negatives)} "
         f"contrast_temperature={float(counterfactual_contrast_temperature):.6g} "
         f"contrast_mode={counterfactual_contrast_mode} repair_greedy={bool(repair_greedy)}"
@@ -841,6 +873,7 @@ def compute_counterfactual_regret(
     _debug_token_delta("z_t -> baseline_tokens", z_t, baseline_tokens)
     _debug_tensor("baseline_tokens", baseline_tokens)
 
+    baseline_utility_mask = selected_valid.bool()
     if utility_family == "prompt":
         baseline_selected, baseline_utility_mask = compute_prompt_delta_nll(
             model=model,
@@ -916,11 +949,12 @@ def compute_counterfactual_regret(
     _debug_tensor("baseline_selected_utility", baseline_selected)
 
     counterfactual_regrets = torch.zeros_like(baseline_selected)
-    pair = torch.nonzero(selected_valid, as_tuple=False)
+    regret_valid = selected_valid.bool() & baseline_utility_mask.bool()
+    pair = torch.nonzero(regret_valid, as_tuple=False)
     _debug(f"valid_selected_pairs={int(pair.shape[0])}")
     if pair.numel() == 0:
         _debug("No valid selected positions; returning all-zero counterfactual regrets.")
-        return counterfactual_regrets
+        return counterfactual_regrets, regret_valid
 
     chunk_size = max(1, int(counterfactual_chunk_size))
     mask_token_id = int(model.mask_token_id)
@@ -943,7 +977,7 @@ def compute_counterfactual_regret(
             _debug(f"chunk={chunk_id} tok_idx_preview={tok_idx[:debug_preview].tolist()}")
 
         z_cf = z_t[b_idx].clone()
-        z_cf[torch.arange(z_cf.shape[0], device=z_cf.device), tok_idx] = mask_token_id
+        z_cf.scatter_(1, tok_idx.unsqueeze(-1), mask_token_id)
         if debug_chunk:
             _debug_token_delta(f"chunk={chunk_id} z_t[b_idx] -> z_cf", z_t[b_idx], z_cf)
             _debug_tensor(f"chunk={chunk_id} z_cf", z_cf)
@@ -995,6 +1029,7 @@ def compute_counterfactual_regret(
             )
             cf_selected = cf_selected.squeeze(-1)
             cf_utility_mask = cf_utility_mask.squeeze(-1)
+            regret_valid[b_idx, k_idx] = regret_valid[b_idx, k_idx] & cf_utility_mask.bool()
             chunk_regret = cf_selected - baseline_selected[b_idx, k_idx]
             if debug_chunk:
                 _debug_tensor(f"chunk={chunk_id} cf_prompt_selected_utility", cf_selected)
@@ -1024,6 +1059,7 @@ def compute_counterfactual_regret(
             )
             cf_selected = cf_selected.squeeze(-1)
             cf_utility_mask = cf_utility_mask.squeeze(-1)
+            regret_valid[b_idx, k_idx] = regret_valid[b_idx, k_idx] & cf_utility_mask.bool()
             chunk_regret = cf_selected - baseline_selected[b_idx, k_idx]
             if debug_chunk:
                 _debug_tensor(f"chunk={chunk_id} cf_contrast_selected_utility", cf_selected)
@@ -1062,12 +1098,13 @@ def compute_counterfactual_regret(
                 _debug_tensor(f"chunk={chunk_id} cf_token_nll", cf_token_nll)
         counterfactual_regrets[b_idx, k_idx] = chunk_regret
 
-    valid_regrets = counterfactual_regrets[selected_valid]
+    valid_regrets = counterfactual_regrets[regret_valid]
     _debug_tensor("counterfactual_regrets", counterfactual_regrets)
-    _debug_tensor("counterfactual_regrets[selected_valid]", valid_regrets)
-    _debug_regret_signs("counterfactual_regrets[selected_valid] signs", valid_regrets)
+    _debug_tensor("regret_valid", regret_valid)
+    _debug_tensor("counterfactual_regrets[regret_valid]", valid_regrets)
+    _debug_regret_signs("counterfactual_regrets[regret_valid] signs", valid_regrets)
 
-    return counterfactual_regrets
+    return counterfactual_regrets, regret_valid
 
 
 @torch.no_grad()
@@ -1086,7 +1123,6 @@ def masked_pearson_corr(x, y, valid_mask, eps=1e-8):
 
 def gap_weighted_pairwise_rank_loss(scores, regrets, valid_mask, margin=0.05, gap_threshold=0.0, eps=1e-8):
     """Rank higher-regret tokens above lower-regret tokens, weighted by regret gap."""
-    gap_threshold = float(max(0.0, gap_threshold))
     losses = []
     for b in range(scores.shape[0]):
         keep = valid_mask[b].bool()
@@ -1185,9 +1221,36 @@ def maskgen_denoise_step(
     final_step,
 ):
     """Run one MaskGen denoising step and return the next partially masked state."""
-    annealed_temp = float(randomize_temperature) * (1.0 - ratio)
     mask_token_id = int(model.mask_token_id)
     is_mask = token_ids.eq(mask_token_id)
+    active_rows = is_mask.any(dim=-1)
+    if not bool(active_rows.any()):
+        return token_ids
+
+    if not bool(active_rows.all()):
+        out = token_ids.clone()
+        out[active_rows] = maskgen_denoise_step(
+            model=model,
+            token_ids=token_ids[active_rows],
+            condition=condition[active_rows],
+            condition_pooled=condition_pooled[active_rows],
+            ratio=ratio,
+            guidance_scale=guidance_scale,
+            randomize_temperature=randomize_temperature,
+            sample_aesthetic_score=sample_aesthetic_score,
+            softmax_temperature_annealing=softmax_temperature_annealing,
+            refine_softmax_temperature=refine_softmax_temperature,
+            guidance_decay=guidance_decay,
+            guidance_decay_scale_pow=guidance_decay_scale_pow,
+            prob_sorting=prob_sorting,
+            repair_greedy=repair_greedy,
+            none_condition=none_condition[active_rows] if none_condition is not None else None,
+            none_condition_pooled=none_condition_pooled[active_rows] if none_condition_pooled is not None else None,
+            final_step=final_step,
+        )
+        return out
+
+    annealed_temp = float(randomize_temperature) * (1.0 - ratio)
     logits, _, _ = forward_maskgen(
         model=model,
         input_ids=token_ids,
@@ -1224,31 +1287,19 @@ def maskgen_denoise_step(
         return sampled_ids
 
     sampled_logits = torch.where(is_mask, proposed_logits, torch.full_like(proposed_logits, float("inf")))
-    schedule_mask_ratio = float(get_masking_ratio(ratio, model.mask_schedule_strategy))
-    num_samples = token_ids.shape[0]
-    schedule_mask_len = torch.full(
-        (num_samples,),
-        int(math.floor(int(model.image_seq_len) * schedule_mask_ratio)),
-        dtype=torch.long,
-        device=token_ids.device,
-    )
-    remaining_masks = is_mask.sum(dim=-1).long()
-    mask_len = torch.where(
-        remaining_masks > 0,
-        torch.maximum(
-            torch.ones_like(remaining_masks),
-            torch.minimum(remaining_masks - 1, schedule_mask_len),
-        ),
-        torch.zeros_like(remaining_masks),
-    )
+    mask_ratio = get_masking_ratio(ratio, model.mask_schedule_strategy)
+    mask_len = torch.floor(model.image_seq_len * mask_ratio).to(token_ids.device)
+    mask_len = torch.maximum(
+        torch.Tensor([1]).to(token_ids.device),
+        torch.minimum(torch.sum(is_mask, dim=-1, keepdims=True) - 1, mask_len),
+    )[0].squeeze()
 
     confidence = sampled_logits
     if bool(prob_sorting) and not bool(repair_greedy):
         confidence = _add_gumbel_noise(confidence, annealed_temp)
     sorted_confidence, _ = torch.sort(confidence, dim=-1)
-    safe_k = mask_len.clamp(min=1)
-    cut_off = sorted_confidence.gather(dim=-1, index=(safe_k - 1).unsqueeze(-1))
-    masking = (confidence <= cut_off) & mask_len.unsqueeze(-1).gt(0)
+    cut_off = sorted_confidence[:, mask_len.long() - 1:mask_len.long()]
+    masking = confidence <= cut_off
 
     return torch.where(masking, mask_token_id, sampled_ids)
 
@@ -1277,8 +1328,10 @@ def _rollout_maskgen_steps(
     """Roll token ids forward through normal MaskGen transitions and return final ids plus the last ratio."""
     step_count = _resolve_future_rollout_count(start_step, num_sample_steps, rollout_steps)
     ids = token_ids
+    mask_token_id = int(model.mask_token_id)
     ratio = float(max(1e-6, min(1.0, float(int(start_step) + 1) / float(num_sample_steps))))
-    for step in range(int(start_step), min(int(num_sample_steps), int(start_step) + step_count)):
+    end_step = min(int(num_sample_steps), int(start_step) + step_count)
+    for step in range(int(start_step), end_step):
         ratio = float(step + 1) / float(num_sample_steps)
         ratio = float(max(1e-6, min(1.0, ratio)))
         ids = maskgen_denoise_step(
@@ -1300,6 +1353,9 @@ def _rollout_maskgen_steps(
             none_condition_pooled=none_condition_pooled,
             final_step=step == int(num_sample_steps) - 1,
         )
+        if step + 1 < end_step and not bool(ids.eq(mask_token_id).any()):
+            ratio = float(max(1e-6, min(1.0, float(end_step) / float(num_sample_steps))))
+            break
     return ids, ratio
 
 
@@ -1327,9 +1383,8 @@ def critic_remask_tokens(
     guidance_decay_scale_pow=1.0,
     none_condition=None,
     none_condition_pooled=None,
-    remask_min_score=0.0,
 ):
-    """Apply critic top-k remasking. `remask_ratio` may be a ratio or an absolute schedule budget."""
+    """Apply critic top-k remasking with no absolute score threshold."""
     if critic is None:
         return token_ids
     
@@ -1374,8 +1429,6 @@ def critic_remask_tokens(
         prompt_logits_delta=prompt_logits_delta,
     )
     candidate_mask = token_ids.ne(int(model.mask_token_id))
-    if remask_min_score is not None:
-        candidate_mask = candidate_mask & selection_scores.gt(float(remask_min_score))
     select_idx, select_valid = select_topk_token_positions(
         selection_scores,
         remask_ratio,
@@ -1432,11 +1485,13 @@ def build_rollout_state(
     refine_loops,
     refine_start_step,
     fixed_step,
+    rollout_step_schedule="random",
+    rollout_cycle_index=None,
     softmax_temperature_annealing=False,
 ):
     """
-     creates a realistic partially denoised MaskGen token sequence at a randomly chosen refinement timestep, 
-     optionally simulating earlier frozen-critic remasking, 
+     creates a realistic partially denoised MaskGen token sequence at a selected refinement timestep,
+     optionally simulating earlier frozen-critic remasking,
      so the train critic can learn what action to take at that timestep.
     Build the simple CTRC training decision state:
     1) choose a refinement timestep
@@ -1444,11 +1499,27 @@ def build_rollout_state(
     3) return the current partially masked token state before the critic action
     """
     assert guidance_decay in ["linear", "cosine", "none", "flippedcosine"]
-    
+
     decision_loop_count = _resolve_refine_loop_count(refine_loops, refine_start_step, num_sample_steps)
+    if decision_loop_count <= 0:
+        raise ValueError(
+            "build_rollout_state requires at least one critic decision step; "
+            f"got refine_loops={refine_loops}, refine_start_step={refine_start_step}, "
+            f"num_sample_steps={num_sample_steps}."
+        )
     refine_end_step = int(refine_start_step) + decision_loop_count
     if fixed_step is None or int(fixed_step) < 0:
-        loop_idx = int(torch.randint(0, decision_loop_count, (1,), device=device).item())
+        schedule = str(rollout_step_schedule or "random").strip().lower()
+        if schedule == "cycle":
+            cycle_index = 0 if rollout_cycle_index is None else int(rollout_cycle_index)
+            loop_idx = int(cycle_index % decision_loop_count)
+        elif schedule == "random":
+            loop_idx = int(torch.randint(0, decision_loop_count, (1,), device=device).item())
+        else:
+            raise ValueError(
+                f"Unsupported rollout_step_schedule={rollout_step_schedule!r}. "
+                "Expected 'cycle' or 'random'."
+            )
         step = int(refine_start_step) + loop_idx
     else:
         step = max(int(refine_start_step), min(int(fixed_step), int(refine_end_step) - 1))
@@ -1503,7 +1574,6 @@ def generate_wrapper(
     guidance_decay_scale_pow=1.0,
     prob_sorting=True,
     repair_greedy=False,
-    remask_min_score=0.0,
     refine_loops=None,
 ):
     """Generate tokens with one stepwise engine, optionally inserting CTRC top-k remasking."""
@@ -1514,8 +1584,11 @@ def generate_wrapper(
         raise ValueError("use_critic_head=True requires a non-None critic.")
 
     if sample_aesthetic_score is None:
-        sample_aesthetic_score = 6.5
-    sample_aesthetic_score = float(sample_aesthetic_score)
+        official_aesthetic_score = None
+    else:
+        # Match MaskGen_VQ.generate: passing any non-None aesthetic value enables
+        # the model's configured sampling aesthetic score.
+        official_aesthetic_score = float(getattr(model, "sample_aesthetic_score", sample_aesthetic_score))
 
     condition, condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, captions)
     none_cond, none_cond_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, [""])
@@ -1544,9 +1617,8 @@ def generate_wrapper(
                 condition_pooled=condition_pooled,
                 ratio=ratio,
                 guidance_scale=guidance_scale,
-                sample_aesthetic_score=sample_aesthetic_score,
+                sample_aesthetic_score=official_aesthetic_score,
                 remask_ratio=critic_budget,
-                remask_min_score=remask_min_score,
                 critic_use_hidden=critic_use_hidden,
                 guidance_decay=guidance_decay,
                 guidance_decay_scale_pow=guidance_decay_scale_pow,
@@ -1561,7 +1633,7 @@ def generate_wrapper(
             ratio=ratio,
             guidance_scale=guidance_scale,
             randomize_temperature=randomize_temperature,
-            sample_aesthetic_score=sample_aesthetic_score,
+            sample_aesthetic_score=official_aesthetic_score,
             softmax_temperature_annealing=softmax_temperature_annealing,
             refine_softmax_temperature=refine_softmax_temperature,
             guidance_decay=guidance_decay,
@@ -1587,7 +1659,7 @@ def generate_wrapper(
                 torch.cat([ids, ids], dim=0),
                 torch.cat([condition, none_cond], dim=0),
                 torch.cat([condition_pooled, none_cond_pooled], dim=0),
-                sample_aesthetic_score=sample_aesthetic_score,
+                sample_aesthetic_score=official_aesthetic_score,
             )
             cond_logits_last, uncond_logits_last = logits_all_last[:num_samples], logits_all_last[num_samples:]
             logits_last = cond_logits_last + (cond_logits_last - uncond_logits_last) * cfg_scale_last
@@ -1597,7 +1669,7 @@ def generate_wrapper(
                 ids,
                 condition,
                 condition_pooled,
-                sample_aesthetic_score=sample_aesthetic_score,
+                sample_aesthetic_score=official_aesthetic_score,
             )
         if 0 <= mask_token_id < logits_last.shape[-1]:
             logits_last[..., mask_token_id] = -1e9
@@ -1627,7 +1699,6 @@ def generate_image_vq_batch(
     critic_use_hidden=True,
     refine_softmax_temperature=0.7,
     repair_greedy=False,
-    remask_min_score=0.0,
     refine_loops=None,
 ):
     """Generate image batch from prompts with optional critic-based token refinement."""
@@ -1656,7 +1727,6 @@ def generate_image_vq_batch(
         critic_use_hidden=bool(critic_use_hidden),
         refine_softmax_temperature=refine_softmax_temperature,
         repair_greedy=bool(repair_greedy),
-        remask_min_score=remask_min_score,
     ).to(model_device)
     text_guidance = prepare_text_guidance(prompts, clip_tokenizer, clip_encoder, model_device)
     image = tokenizer.decode_tokens(tokens, text_guidance)
@@ -1762,10 +1832,12 @@ def main():
     logging_cfg = config.logging
     experiment_cfg = config.experiment
 
+    dist_backend = str(os.environ.get("DIST_BACKEND", training.dist_backend))
     device, rank, world_size, local_rank = setup_training_runtime(
         config,
-        dist_backend=str(training.dist_backend),
+        dist_backend=dist_backend,
     )
+    verify_distributed_runtime(device, local_rank=local_rank)
     hf_cache_dir = setup_cache_environment()
     set_global_seed(int(training.seed) + rank)
 
@@ -1920,11 +1992,21 @@ def main():
     train_repair_greedy = bool(training.train_repair_greedy)
     fixed_rollout_step = int(training.fixed_rollout_step)
     fixed_rollout_step_arg = fixed_rollout_step if fixed_rollout_step >= 0 else None
+    rollout_step_schedule = str(getattr(training, "rollout_step_schedule", "random")).strip().lower()
+    rollout_cycle_size = _resolve_refine_loop_count(
+        int(training.refine_loops),
+        int(training.train_refine_start_step),
+        int(model_cfg.sample_steps),
+    )
     tb_logger = None
     if is_main_process() and bool(logging_cfg.enabled):
         tb_logger = TensorboardLogger(log_dir=experiment_cfg.output_dir, run_name="logs", enabled=True)
         tb_logger.log_config(cfg)
         tb_logger.log_text("dataset/pipeline", dataset_pipeline.describe(), step=start_step)
+
+    empty_condition, empty_condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, [""])
+    empty_condition = empty_condition.to(device, non_blocking=True)
+    empty_condition_pooled = empty_condition_pooled.to(device, non_blocking=True)
 
     if int(dataset_cfg.stream_prefetch_batches) > 0:
         stream_prefetch_batches = int(dataset_cfg.stream_prefetch_batches)
@@ -1962,9 +2044,8 @@ def main():
                 condition, condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, captions)
                 condition = condition.to(device, non_blocking=True)
                 condition_pooled = condition_pooled.to(device, non_blocking=True)
-                none_condition, none_condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, [""])
-                none_condition = none_condition.repeat(batch_size, 1, 1).to(device, non_blocking=True)
-                none_condition_pooled = none_condition_pooled.repeat(batch_size, 1, 1).to(device, non_blocking=True)
+                none_condition = empty_condition.expand(batch_size, -1, -1)
+                none_condition_pooled = empty_condition_pooled.expand(batch_size, -1, -1)
 
                 # Build the partially denoised token state for the current training step, 
                 # by simulating forward from the all-mask state up to a random refinement step.
@@ -1984,6 +2065,8 @@ def main():
                     refine_start_step=int(training.train_refine_start_step),
                     repair_greedy=train_repair_greedy,
                     fixed_step=fixed_rollout_step_arg,
+                    rollout_step_schedule=rollout_step_schedule,
+                    rollout_cycle_index=step,
                     refine_softmax_temperature=0.7,
                     guidance_decay="cosine",
                     guidance_decay_scale_pow=1.0,
@@ -2025,12 +2108,23 @@ def main():
                         none_condition_pooled=none_condition_pooled,
                     )
                     prompt_logits_delta_orig = None
-                # The critic only needs to learn to predict regret for tokens that are actually visible (not masked) at this step, 
-                # since those are the only ones it can change in the next step. So we compute counterfactual regrets only for the visible tokens, and use those as targets to train the critic.
+                # The critic only needs labels for a budget-sized subset of visible tokens.
+                # Tying the sampled subset to the remask budget keeps training aligned with inference
+                # while avoiding the prohibitively expensive all-visible-token counterfactual sweep.
                 base_candidate_mask = z_t.ne(int(model.mask_token_id))
-                selected_idx, selected_valid = select_all_token_positions(base_candidate_mask)
+                train_label_budget = _resolve_schedule_remask_count(
+                    model,
+                    timesteps,
+                    budget_fraction=float(training.train_remask_ratio),
+                )
+                selected_idx, selected_valid = select_budget_token_positions(
+                    base_candidate_mask,
+                    budget_count=train_label_budget,
+                    multiplier=float(getattr(training, "counterfactual_train_budget_multiplier", 1.0)),
+                    min_tokens=1,
+                )
                 
-                counterfactual_regrets = compute_counterfactual_regret(
+                counterfactual_regrets, regret_valid = compute_counterfactual_regret(
                     model=model,
                     gt_tokens=gt_tokens,
                     z_t=z_t,
@@ -2044,7 +2138,6 @@ def main():
                     counterfactual_chunk_size=int(training.counterfactual_chunk_size),
                     counterfactual_rollout_steps=int(training.counterfactual_rollout_steps),
                     counterfactual_utility=str(training.counterfactual_utility),
-                    counterfactual_window_radius=int(training.counterfactual_window_radius),
                     counterfactual_contrast_negatives=int(training.counterfactual_contrast_negatives),
                     counterfactual_contrast_temperature=float(training.counterfactual_contrast_temperature),
                     counterfactual_contrast_mode=str(training.counterfactual_contrast_mode),
@@ -2072,16 +2165,16 @@ def main():
             targets = transform_regret_targets(
                 counterfactual_regrets,
                 transform=str(training.regret_target_transform),
-                valid_mask=selected_valid,
+                valid_mask=regret_valid,
             )
-            valid_float = selected_valid.float()
+            valid_float = regret_valid.float()
             loss_mse = ((pred_sel - targets).pow(2) * valid_float).sum() / valid_float.sum().clamp(min=1.0)
 
             if training.lambda_rank > 0.0:
                 full_regret_targets = torch.zeros_like(pred_regret)
                 full_regret_targets.scatter_(dim=-1, index=selected_idx, src=targets.detach())
                 full_valid_mask = torch.zeros_like(base_candidate_mask, dtype=torch.bool)
-                full_valid_mask.scatter_(dim=-1, index=selected_idx, src=selected_valid.bool())
+                full_valid_mask.scatter_(dim=-1, index=selected_idx, src=regret_valid.bool())
                 loss_rank = gap_weighted_pairwise_rank_loss(
                     scores=pred_regret,
                     regrets=full_regret_targets,
@@ -2104,7 +2197,7 @@ def main():
             step += 1
             pbar.update(1)
             if is_main_process() and step % 1 == 0:
-                keep = selected_valid
+                keep = regret_valid
                 pred_regret_log = pred_regret.detach()
                 pred_sel_log = pred_sel.detach()
                 targets_log = targets.detach()
@@ -2113,8 +2206,8 @@ def main():
                     timesteps,
                     budget_fraction=float(training.train_remask_ratio),
                 )
-                regret_corr = masked_pearson_corr(pred_sel_log, counterfactual_regrets, selected_valid)
-                target_corr = masked_pearson_corr(pred_sel_log, targets_log, selected_valid)
+                regret_corr = masked_pearson_corr(pred_sel_log, counterfactual_regrets, regret_valid)
+                target_corr = masked_pearson_corr(pred_sel_log, targets_log, regret_valid)
                 visible_pred_mean = float(pred_regret_log[base_candidate_mask].mean().item()) if base_candidate_mask.any() else 0.0
                 masked_pred_mean = float(pred_regret_log[~base_candidate_mask].mean().item()) if (~base_candidate_mask).any() else 0.0
                 regret_positive_fraction = float(counterfactual_regrets[keep].gt(0.0).float().mean().item()) if keep.any() else 0.0
@@ -2123,7 +2216,7 @@ def main():
                 top_pred_idx, top_pred_valid = select_topk_token_positions(
                     pred_sel_log,
                     diag_k,
-                    candidate_mask=selected_valid,
+                    candidate_mask=regret_valid,
                     min_tokens=1,
                 )
                 top_pred_true = counterfactual_regrets.gather(dim=-1, index=top_pred_idx)
@@ -2134,17 +2227,31 @@ def main():
                 oracle_idx, oracle_valid = select_topk_token_positions(
                     counterfactual_regrets,
                     diag_k,
-                    candidate_mask=selected_valid,
+                    candidate_mask=regret_valid,
                     min_tokens=1,
                 )
                 oracle_true = counterfactual_regrets.gather(dim=-1, index=oracle_idx)
                 oracle_true_mean = float(oracle_true[oracle_valid].mean().item()) if oracle_valid.any() else 0.0
+                pred_sel_mean = float(pred_sel_log[keep].mean().item()) if keep.any() else 0.0
                 tgt_mean = float(targets_log[keep].mean().item()) if keep.any() else 0.0
                 tgt_std = float(targets_log[keep].std(unbiased=False).item()) if keep.any() else 0.0
+                pred_target_mean_error = pred_sel_mean - tgt_mean
+                pred_target_mean_abs_error = abs(pred_target_mean_error)
+                pred_target_std_ratio = (pred_sel_std / max(tgt_std, 1e-8)) if keep.any() else 0.0
                 constant_target_mse = (
                     float(((targets_log - tgt_mean).pow(2) * valid_float).sum().item() / valid_float.sum().clamp(min=1.0).item())
                     if keep.any()
                     else 0.0
+                )
+                loss_mse_value = float(loss_mse.item())
+                mse_vs_constant_ratio = (loss_mse_value / max(constant_target_mse, 1e-8)) if keep.any() else 0.0
+                constant_baseline_improvement = constant_target_mse - loss_mse_value
+                beats_constant_baseline = float(loss_mse_value < constant_target_mse) if keep.any() else 0.0
+                rollout_step_index = int(rollout_step_indices[0].item()) if rollout_step_indices.numel() > 0 else -1
+                rollout_cycle_position = (
+                    float(rollout_step_index - int(training.train_refine_start_step))
+                    if rollout_step_index >= 0
+                    else -1.0
                 )
                 pbar.set_postfix({
                     "loss": float(loss.item()),
@@ -2158,6 +2265,8 @@ def main():
                 if tb_logger is not None and step % max(1, int(training.log_every)) == 0:
                     selected_count = float(selected_valid.float().sum().item())
                     selected_frac = float(selected_valid.float().mean().item()) if selected_valid.numel() > 0 else 0.0
+                    regret_valid_count = float(regret_valid.float().sum().item())
+                    regret_valid_frac = float(regret_valid.float().mean().item()) if regret_valid.numel() > 0 else 0.0
                     regret_mean = float(counterfactual_regrets[keep].mean().item()) if keep.any() else 0.0
                     regret_std = float(counterfactual_regrets[keep].std(unbiased=False).item()) if keep.any() else 0.0
                     tb_logger.log_metrics(
@@ -2174,8 +2283,12 @@ def main():
                             "train/constant_target_mse": constant_target_mse,
                             "train/regret_mean": regret_mean,
                             "train/regret_std": regret_std,
+                            "train/pred_selected_mean": pred_sel_mean,
                             "train/target_mean": tgt_mean,
                             "train/target_std": tgt_std,
+                            "train/pred_target_mean_error": pred_target_mean_error,
+                            "train/pred_target_mean_abs_error": pred_target_mean_abs_error,
+                            "train/pred_target_std_ratio": pred_target_std_ratio,
                             "train/regret_positive_fraction": regret_positive_fraction,
                             "train/pred_positive_fraction": pred_positive_fraction,
                             "train/pred_selected_std": pred_sel_std,
@@ -2187,15 +2300,26 @@ def main():
                             "train/pred_masked_mean": masked_pred_mean,
                             "train/target_critic_ema_decay": target_ema_decay,
                             "train/fixed_rollout_step": fixed_rollout_step,
+                            "train/rollout_schedule_is_cycle": float(rollout_step_schedule == "cycle"),
+                            "train/rollout_cycle_size": float(rollout_cycle_size),
+                            "train/rollout_step_index": float(rollout_step_index),
+                            "train/rollout_cycle_position": rollout_cycle_position,
                             "train/train_repair_greedy": int(train_repair_greedy),
                             "train/train_randomize_temperature": float(training.train_randomize_temperature),
                             "train/counterfactual_rollout_steps": int(training.counterfactual_rollout_steps),
-                            "train/counterfactual_window_radius": int(training.counterfactual_window_radius),
                             "train/counterfactual_contrast_negatives": int(training.counterfactual_contrast_negatives),
                             "train/counterfactual_contrast_temperature": float(training.counterfactual_contrast_temperature),
                             "train/counterfactual_repair_greedy": int(bool(training.counterfactual_repair_greedy)),
+                            "train/counterfactual_train_budget_multiplier": float(
+                                getattr(training, "counterfactual_train_budget_multiplier", 1.0)
+                            ),
+                            "train/loss_mse_vs_constant_ratio": mse_vs_constant_ratio,
+                            "train/constant_baseline_improvement": constant_baseline_improvement,
+                            "train/beats_constant_baseline": beats_constant_baseline,
                             "train/selected_count": selected_count,
                             "train/selected_fraction": selected_frac,
+                            "train/regret_valid_count": regret_valid_count,
+                            "train/regret_valid_fraction": regret_valid_frac,
                             "train/timestep_mean": float(timesteps.mean().item()),
                         },
                     )
@@ -2222,4 +2346,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_distributed()

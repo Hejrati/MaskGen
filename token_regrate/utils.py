@@ -128,34 +128,92 @@ def is_main_process():
     return get_rank() == 0
 
 
-def setup_distributed(backend="gloo"):
+def resolve_distributed_backend(backend="nccl", device_type=None):
+    """Resolve the requested distributed backend for the available runtime."""
+    requested = str(backend or "nccl").strip().lower()
+    device_type = str(device_type or ("cuda" if torch.cuda.is_available() else "cpu")).strip().lower()
+    if requested == "nccl" and device_type != "cuda":
+        return "gloo"
+    return requested
+
+
+def setup_distributed(backend="nccl", device_type=None):
     """Initialize distributed process group when launched with torchrun."""
     if int(os.environ.get("WORLD_SIZE", "1")) <= 1 or is_dist():
         return
     # Use torchrun-provided rendezvous variables to initialize DDP.
-    dist.init_process_group(backend=str(backend), init_method="env://")
+    resolved_backend = resolve_distributed_backend(backend=backend, device_type=device_type)
+    dist.init_process_group(backend=resolved_backend, init_method="env://")
 
 
-def setup_training_runtime(config, dist_backend="gloo"):
+def setup_training_runtime(config, dist_backend="nccl"):
     """Initialize device and distributed state for a training entrypoint."""
-    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    cuda_available = torch.cuda.is_available()
+    gpu_count = torch.cuda.device_count() if cuda_available else 0
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     config.runtime.local_rank = int(local_rank)
 
-    if torch.cuda.is_available():
-        local_rank = max(0, min(local_rank, gpu_count - 1))
+    if cuda_available:
+        if local_rank < 0 or local_rank >= gpu_count:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} but only {gpu_count} CUDA device(s) are visible. "
+                "Launch with --nproc_per_node no larger than torch.cuda.device_count(), "
+                "or set CUDA_VISIBLE_DEVICES/TOKEN_REGRET_NPROC to match the available GPUs."
+            )
+        if world_size_env > gpu_count:
+            raise RuntimeError(
+                f"WORLD_SIZE={world_size_env} but only {gpu_count} CUDA device(s) are visible. "
+                "NCCL DDP needs one visible CUDA device per local process."
+            )
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(local_rank)
     else:
         device = torch.device("cpu")
 
-    setup_distributed(backend=dist_backend)
+    resolved_backend = resolve_distributed_backend(backend=dist_backend, device_type=device.type)
+    setup_distributed(backend=resolved_backend, device_type=device.type)
     rank = get_rank()
     world_size = get_world_size()
 
     config.runtime.world_size = int(world_size)
     config.runtime.ddp = bool(world_size > 1 and device.type == "cuda")
+    config.runtime.dist_backend = resolved_backend
     return device, rank, world_size, local_rank
+
+
+def verify_distributed_runtime(device, local_rank=None):
+    """Log rank/device mapping and run a tiny collective before expensive model setup."""
+    if not is_dist():
+        return
+
+    rank = get_rank()
+    world_size = get_world_size()
+    backend = dist.get_backend()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0") if local_rank is None else local_rank)
+    device_name = str(device)
+    if device.type == "cuda":
+        device_name = torch.cuda.get_device_name(device)
+    print(
+        f"[rank{rank}] backend={backend} world_size={world_size} "
+        f"local_rank={local_rank} device={device} device_name={device_name}",
+        flush=True,
+    )
+
+    if str(backend).lower() != "nccl" or device.type != "cuda":
+        return
+
+    try:
+        probe = torch.ones(1, device=device, dtype=torch.float32) * float(rank + 1)
+        dist.all_reduce(probe, op=dist.ReduceOp.SUM)
+        torch.cuda.synchronize(device)
+    except Exception as exc:
+        raise RuntimeError(
+            "NCCL failed during an early one-tensor all_reduce before DDP wrapped the model. "
+            "This points to GPU communication, driver/runtime state, or NCCL topology setup rather than critic model code. "
+            "Try rerunning with NCCL_DEBUG=INFO. On single-node workstations, also try NCCL_P2P_DISABLE=1 "
+            "and NCCL_IB_DISABLE=1 to rule out peer-to-peer or InfiniBand transport issues."
+        ) from exc
 
 
 def setup_cache_environment(cache_dir=None):
@@ -264,7 +322,7 @@ def initialize_token_regret_critic_model(model, use_hidden=True, prompt_gap_topk
         hidden_dim=hidden_dim,
         text_dim=text_dim,
         use_hidden=bool(use_hidden),
-        prompt_gap_topk=max(0, int(prompt_gap_topk)),
+        prompt_gap_topk=int(prompt_gap_topk),
     )
 
 
@@ -274,7 +332,7 @@ def load_trained_critic(ckpt_path, model, use_hidden=True, prompt_gap_topk=8):
     critic = initialize_token_regret_critic_model(
         model,
         use_hidden=use_hidden,
-        prompt_gap_topk=max(0, int(prompt_gap_topk)),
+        prompt_gap_topk=int(prompt_gap_topk),
     ).to(target_device)
     _ = load_critic_checkpoint(ckpt_path, critic, optimizer=None, map_location=target_device)
     critic.eval()

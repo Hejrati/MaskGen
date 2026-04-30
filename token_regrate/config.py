@@ -2,7 +2,7 @@ from ml_collections import config_dict
 import os
 
 # Unified output directory for this config module.
-OUTPUT_DIR = "outputs/token_regret_critic_new"
+OUTPUT_DIR = "outputs/token_regret_critic_tanh"
 
 
 def get_config():
@@ -21,41 +21,38 @@ def get_config():
     # Base random seed; each DDP rank uses seed + rank for deterministic-but-distinct streams.
     config.training.seed = 42
     # Number of passes over the configured stream or fixed subset, unless max_steps stops first.
-    config.training.num_epochs = 50
+    config.training.num_epochs = 100
     # Hard cap on optimizer steps after resume; 0 means no explicit step cap.
     config.training.max_steps = 0
     # If >0, collect this many examples once and replay only that fixed subset; 0 uses the full dataset stream.
-    config.training.max_train_images = 0
+    config.training.max_train_images = 10_000
     # Per-process batch size; total global batch is this value times world_size.
-    config.training.per_gpu_batch_size = 64
+    config.training.per_gpu_batch_size = 128
     # AdamW learning rate for the trainable token-regret critic only; generator/tokenizer stay frozen.
     config.training.learning_rate = 2e-4
     # Number of candidate token counterfactuals evaluated per chunk to control memory use.
-    config.training.counterfactual_chunk_size = 512
+    config.training.counterfactual_chunk_size = 128
     # Number of plain MaskGen denoise steps rolled forward after each token-remask counterfactual.
-    config.training.counterfactual_rollout_steps = -1
-    # Utility used to score baseline-vs-counterfactual quality; use one of:
-    # token_ce, local_window_ce, full_sequence_ce, token_prompt, local_window_prompt,
-    # full_sequence_prompt, token_contrast, local_window_contrast, full_sequence_contrast.
-    config.training.counterfactual_utility = "local_window_contrast"
-    # Extra neighboring token radius included around the tested token for local-window utilities; 0 = token only.
-    config.training.counterfactual_window_radius = 6
+    config.training.counterfactual_rollout_steps = 2
+    # Utility used to score baseline-vs-counterfactual quality; token-based utilities
+    # consider only the selected token, while full_sequence_* utilities score the whole sequence.
+    config.training.counterfactual_utility = "token_prompt"
     # Number of mismatched batch prompts used by contrastive utilities; <=0 uses every available local-batch negative.
-    config.training.counterfactual_contrast_negatives = 2
+    config.training.counterfactual_contrast_negatives = 4
     # Temperature for InfoNCE-style contrastive prompt utility.
     config.training.counterfactual_contrast_temperature = 1.0
     # Contrastive utility reduction: "nce" uses log p(correct prompt), "neg_logsumexp" excludes the positive from the denominator.
     config.training.counterfactual_contrast_mode = "nce"
     # Use argmax instead of Gumbel sampling inside counterfactual rollouts.
     config.training.counterfactual_repair_greedy = True
-    # Number of top cond-minus-uncond logit-gap features exposed to the regret critic; 0 disables them.
+    # Number of top cond-minus-uncond logit-gap features exposed to the regret critic nn; 0 disables them.
     config.training.critic_prompt_gap_topk = 8
     # Transform raw counterfactual regret targets before MSE; supported: "none"/"tanh"/"zscore".
     config.training.regret_target_transform = "tanh"
     # Notebook/control flag for DDP-only workflows; the training entrypoint does not currently branch on it.
     config.training.ddp_only = False
-    # torch.distributed backend used by torchrun; "gloo" works on CPU/single-GPU, "nccl" is typical multi-GPU.
-    config.training.dist_backend = "gloo"
+    # torch.distributed backend used by torchrun; default to "nccl" for CUDA DDP and fall back to "gloo" in CPU-only runtime setup.
+    config.training.dist_backend = "nccl"
     # Classifier-free guidance scale used when building training states and counterfactual logits.
     config.training.train_guidance_scale = 12.0
     # Gumbel/random sampling temperature for training-state and counterfactual denoising; 0 makes it deterministic.
@@ -64,10 +61,16 @@ def get_config():
     config.training.train_aesthetic_score = 6.5
     # Fraction of the current MaskGen schedule mask budget that the critic may re-mask at guided steps.
     config.training.train_remask_ratio = 0.2
+    # Number of token counterfactual labels to sample per example, expressed as a multiple of the critic remask budget.
+    # Values >1 keep supervision broader than inference while avoiding all-visible-token labeling.
+    config.training.counterfactual_train_budget_multiplier = 2.0
     # First sample step index where critic-guided refinement is allowed.
     config.training.train_refine_start_step = 8
     # Use argmax instead of Gumbel sampling while simulating the training-time MaskGen trajectory.
     config.training.train_repair_greedy = True
+    # How to choose rollout decision steps when fixed_rollout_step < 0: "cycle" visits each step in order,
+    # while "random" samples a step uniformly each update.
+    config.training.rollout_step_schedule = "cycle"
     # Fixed critic decision step for every training example; negative would sample uniformly over refine steps.
     config.training.fixed_rollout_step = -1
     # Max gradient norm for critic parameters; <=0 disables gradient clipping.
@@ -75,7 +78,7 @@ def get_config():
     # Weight on the auxiliary pairwise ranking loss; 0 trains only the MSE regret regression loss.
     config.training.lambda_rank = 0.05
     # Margin used by the pairwise ranking loss when lambda_rank > 0.
-    config.training.rank_margin = 0.1
+    config.training.rank_margin = 0.0
     # Minimum target-regret gap required for a token pair to contribute to ranking loss.
     config.training.rank_gap_threshold = 0.1
     # EMA decay for the frozen target critic; closer to 1 updates it more slowly.
@@ -96,8 +99,7 @@ def get_config():
     config.inference.remask_ratio = config.training.train_remask_ratio
     # Inference-time first critic-guided step; defaults to the training start step.
     config.inference.refine_start_step = config.training.train_refine_start_step
-    # Minimum predicted regret required for critic remasking; 0 means only predicted-positive gains reopen.
-    config.inference.remask_min_score = 0.0
+    # Critic-guided inference always uses pure top-k remasking with no absolute score threshold.
     # Use argmax instead of stochastic sampling during inference/evaluation generation.
     config.inference.repair_greedy = True
 
@@ -148,5 +150,7 @@ def get_config():
     config.runtime.ddp = False
     # Filled by setup_training_runtime from LOCAL_RANK and used to select the CUDA device.
     config.runtime.local_rank = 0
+    # Filled by setup_training_runtime with the backend actually used to initialize torch.distributed.
+    config.runtime.dist_backend = config.training.dist_backend
 
     return config
