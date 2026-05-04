@@ -198,13 +198,10 @@ def _canonical_counterfactual_utility(name):
     name = str(name or "token_ce").strip().lower()
     canonical = {
         "token_ce",
-        "local_window_ce",
         "full_sequence_ce",
         "token_prompt",
-        "local_window_prompt",
         "full_sequence_prompt",
         "token_contrast",
-        "local_window_contrast",
         "full_sequence_contrast",
     }
     if name in canonical:
@@ -212,20 +209,18 @@ def _canonical_counterfactual_utility(name):
 
     aliases = {
         "token": "token_ce",
-        "local": "local_window_ce",
         "full": "full_sequence_ce",
-        "prompt": "local_window_prompt",
-        "contrast": "local_window_contrast",
+        "prompt": "token_prompt",
+        "contrast": "token_contrast",
     }
     if name in aliases:
         return aliases[name]
 
     raise ValueError(
         f"Unsupported counterfactual_utility={name!r}. "
-        "Expected token_ce, local_window_ce, full_sequence_ce, "
-        "token_prompt, local_window_prompt, full_sequence_prompt, "
-        "token_contrast, local_window_contrast, or full_sequence_contrast. "
-        "Supported shorthands: token, local, full, prompt, contrast."
+        "Expected token_ce, full_sequence_ce, token_prompt, full_sequence_prompt, "
+        "token_contrast, or full_sequence_contrast. "
+        "Supported shorthands: token, full, prompt, contrast."
     )
 
 
@@ -244,12 +239,10 @@ def _counterfactual_utility_reduction(counterfactual_utility):
     utility = _canonical_counterfactual_utility(counterfactual_utility)
     if utility.startswith("full_sequence_"):
         return "full_sequence"
-    if utility.startswith("local_window_"):
-        return "local_window"
     return "token"
 
 
-def _reduce_counterfactual_utility(token_values, selected_idx, counterfactual_utility, window_radius=0, value_mask=None):
+def _reduce_counterfactual_utility(token_values, selected_idx, counterfactual_utility, value_mask=None):
     """Reduce per-token utility values to the scalar attached to each selected intervention."""
     reduction = _counterfactual_utility_reduction(counterfactual_utility)
     if value_mask is None:
@@ -265,25 +258,6 @@ def _reduce_counterfactual_utility(token_values, selected_idx, counterfactual_ut
         gathered_values = token_values.gather(dim=-1, index=selected_idx)
         gathered_weights = weights.gather(dim=-1, index=selected_idx)
         return gathered_values * gathered_weights
-
-    radius = max(0, int(window_radius))
-    if radius == 0:
-        gathered_values = token_values.gather(dim=-1, index=selected_idx)
-        gathered_weights = weights.gather(dim=-1, index=selected_idx)
-        return gathered_values * gathered_weights
-
-    bsz, seq_len = token_values.shape
-    select_count = selected_idx.shape[1]
-    offsets = torch.arange(-radius, radius + 1, device=token_values.device)
-    window_idx = selected_idx.unsqueeze(-1) + offsets.view(1, 1, -1)
-    in_bounds = window_idx.ge(0) & window_idx.lt(seq_len)
-    safe_idx = window_idx.clamp(min=0, max=seq_len - 1)
-    gathered_values = token_values.gather(dim=-1, index=safe_idx.reshape(bsz, -1))
-    gathered_values = gathered_values.reshape(bsz, select_count, -1)
-    gathered_weights = weights.gather(dim=-1, index=safe_idx.reshape(bsz, -1))
-    gathered_weights = gathered_weights.reshape(bsz, select_count, -1)
-    gathered_weights = gathered_weights * in_bounds.to(dtype=token_values.dtype)
-    return (gathered_values * gathered_weights).sum(dim=-1) / gathered_weights.sum(dim=-1).clamp(min=1.0)
 
 
 def _masked_token_nll(logits, target_tokens, valid_mask):
@@ -325,8 +299,8 @@ def _masked_mean_token_nll(logits, target_tokens, valid_mask):
     return nll_sum / count.clamp(min=1.0), count
 
 
-def _build_masked_probe_inputs(target_tokens, token_positions, mask_token_id, window_radius=0):
-    """Build per-row masked probe inputs for token or local-window prompt utilities."""
+def _build_masked_probe_inputs(target_tokens, token_positions, mask_token_id):
+    """Build per-row masked probe inputs for token prompt utilities."""
     probe_tokens = target_tokens.clone()
     target_mask = torch.zeros_like(probe_tokens, dtype=torch.bool)
     if token_positions.numel() == 0:
@@ -334,22 +308,11 @@ def _build_masked_probe_inputs(target_tokens, token_positions, mask_token_id, wi
 
     seq_len = int(target_tokens.shape[1])
     row = torch.arange(target_tokens.shape[0], device=target_tokens.device)
-    radius = max(0, int(window_radius))
-    if radius == 0:
-        safe_pos = token_positions.clamp(min=0, max=seq_len - 1)
-        keep = token_positions.ge(0) & token_positions.lt(seq_len)
-        keep = keep & target_tokens[row, safe_pos].ne(int(mask_token_id))
-        if bool(keep.any()):
-            target_mask[row[keep], safe_pos[keep]] = True
-    else:
-        offsets = torch.arange(-radius, radius + 1, device=target_tokens.device)
-        window_idx = token_positions.unsqueeze(-1) + offsets.view(1, -1)
-        in_bounds = window_idx.ge(0) & window_idx.lt(seq_len)
-        safe_pos = window_idx.clamp(min=0, max=seq_len - 1)
-        row_idx = row.unsqueeze(-1).expand_as(safe_pos)
-        keep = in_bounds & target_tokens.gather(dim=-1, index=safe_pos).ne(int(mask_token_id))
-        if bool(keep.any()):
-            target_mask[row_idx[keep], safe_pos[keep]] = True
+    safe_pos = token_positions.clamp(min=0, max=seq_len - 1)
+    keep = token_positions.ge(0) & token_positions.lt(seq_len)
+    keep = keep & target_tokens[row, safe_pos].ne(int(mask_token_id))
+    if bool(keep.any()):
+        target_mask[row[keep], safe_pos[keep]] = True
 
     probe_tokens[target_mask] = int(mask_token_id)
     return probe_tokens, target_mask
@@ -365,8 +328,7 @@ def compute_prompt_delta_nll(
     condition_pooled,
     none_condition,
     none_condition_pooled,
-    counterfactual_utility="local_window_prompt",
-    window_radius=0,
+    counterfactual_utility="token_prompt",
     probe_chunk_size=64,
     ratio=None,
     guidance_scale=12.0,
@@ -388,7 +350,6 @@ def compute_prompt_delta_nll(
     out = torch.zeros(selected_idx.shape, dtype=torch.float32, device=token_ids.device)
     out_valid = torch.zeros_like(selected_valid, dtype=torch.bool)
     chunk_size = max(1, int(probe_chunk_size))
-    probe_window_radius = max(0, int(window_radius)) if reduction == "local_window" else 0
 
     def _score_probe_batch(probe_tokens, target_tokens, target_mask, cond, cond_pooled, uncond, uncond_pooled):
         _, _, _, cond_logits, uncond_logits = forward_maskgen(
@@ -425,7 +386,6 @@ def compute_prompt_delta_nll(
                 target_tokens,
                 pos_idx,
                 mask_token_id,
-                window_radius=0,
             )
             row = torch.arange(probe_tokens.shape[0], device=token_ids.device)
             delta, target_mask = _score_probe_batch(
@@ -463,7 +423,6 @@ def compute_prompt_delta_nll(
             target_tokens,
             tok_idx,
             mask_token_id,
-            window_radius=probe_window_radius,
         )
 
         delta, target_mask = _score_probe_batch(
@@ -531,8 +490,7 @@ def compute_contrastive_prompt_utility(
     condition_bank=None,
     condition_pooled_bank=None,
     positive_indices=None,
-    counterfactual_utility="local_window_contrast",
-    window_radius=0,
+    counterfactual_utility="token_contrast",
     negative_count=2,
     temperature=1.0,
     contrast_mode="nce",
@@ -620,7 +578,6 @@ def compute_contrastive_prompt_utility(
                 target_tokens,
                 pos_idx,
                 mask_token_id,
-                window_radius=0,
             )
             nll, count = _candidate_nll_batch(
                 probe_tokens,
@@ -648,7 +605,6 @@ def compute_contrastive_prompt_utility(
     if pair.numel() == 0:
         return out, out_valid
 
-    probe_window_radius = max(0, int(window_radius)) if reduction == "local_window" else 0
     for start in range(0, pair.shape[0], chunk_size):
         part = pair[start:start + chunk_size]
         if part.numel() == 0:
@@ -661,7 +617,6 @@ def compute_contrastive_prompt_utility(
             target_tokens,
             tok_idx,
             mask_token_id,
-            window_radius=probe_window_radius,
         )
 
         nll, count = _candidate_nll_batch(
@@ -730,7 +685,6 @@ def compute_counterfactual_regret(
     guidance_scale,
     randomize_temperature,
     softmax_temperature_annealing,
-    refine_softmax_temperature,
     guidance_decay,
     guidance_decay_scale_pow,
     prob_sorting,
@@ -832,7 +786,6 @@ def compute_counterfactual_regret(
 
     utility_name = _canonical_counterfactual_utility(counterfactual_utility)
     utility_family = _counterfactual_utility_family(utility_name)
-    window_radius = 0
     start_step = int(step_indices[0].item())
     _debug(
         f"start_step={start_step} num_sample_steps={int(num_sample_steps)} "
@@ -861,7 +814,6 @@ def compute_counterfactual_regret(
         randomize_temperature=randomize_temperature,
         sample_aesthetic_score=sample_aesthetic_score,
         softmax_temperature_annealing=softmax_temperature_annealing,
-        refine_softmax_temperature=refine_softmax_temperature,
         guidance_decay=guidance_decay,
         guidance_decay_scale_pow=guidance_decay_scale_pow,
         prob_sorting=prob_sorting,
@@ -885,7 +837,6 @@ def compute_counterfactual_regret(
             none_condition=none_condition,
             none_condition_pooled=none_condition_pooled,
             counterfactual_utility=utility_name,
-            window_radius=window_radius,
             probe_chunk_size=counterfactual_chunk_size,
             ratio=target_ratio,
             guidance_scale=guidance_scale,
@@ -908,7 +859,6 @@ def compute_counterfactual_regret(
             condition_pooled_bank=condition_pooled,
             positive_indices=torch.arange(baseline_tokens.shape[0], device=baseline_tokens.device),
             counterfactual_utility=utility_name,
-            window_radius=window_radius,
             negative_count=counterfactual_contrast_negatives,
             temperature=counterfactual_contrast_temperature,
             contrast_mode=counterfactual_contrast_mode,
@@ -943,7 +893,6 @@ def compute_counterfactual_regret(
             baseline_token_nll,
             selected_idx,
             utility_name,
-            window_radius,
         ).to(dtype=baseline_token_nll.dtype)
         _debug_tensor("baseline_token_nll", baseline_token_nll)
     _debug_tensor("baseline_selected_utility", baseline_selected)
@@ -994,7 +943,6 @@ def compute_counterfactual_regret(
             randomize_temperature=randomize_temperature,
             sample_aesthetic_score=sample_aesthetic_score,
             softmax_temperature_annealing=softmax_temperature_annealing,
-            refine_softmax_temperature=refine_softmax_temperature,
             guidance_decay=guidance_decay,
             guidance_decay_scale_pow=guidance_decay_scale_pow,
             prob_sorting=prob_sorting,
@@ -1019,7 +967,6 @@ def compute_counterfactual_regret(
                 none_condition=none_condition[b_idx] if none_condition is not None else None,
                 none_condition_pooled=none_condition_pooled[b_idx] if none_condition_pooled is not None else None,
                 counterfactual_utility=utility_name,
-                window_radius=window_radius,
                 probe_chunk_size=counterfactual_chunk_size,
                 ratio=cf_ratio,
                 guidance_scale=guidance_scale,
@@ -1046,7 +993,6 @@ def compute_counterfactual_regret(
                 condition_pooled_bank=condition_pooled,
                 positive_indices=b_idx,
                 counterfactual_utility=utility_name,
-                window_radius=window_radius,
                 negative_count=counterfactual_contrast_negatives,
                 temperature=counterfactual_contrast_temperature,
                 contrast_mode=counterfactual_contrast_mode,
@@ -1086,7 +1032,6 @@ def compute_counterfactual_regret(
                 cf_token_nll,
                 tok_idx.unsqueeze(-1),
                 utility_name,
-                window_radius,
             ).squeeze(-1)
             chunk_regret = baseline_selected[b_idx, k_idx] - cf_selected
         if debug_chunk:
@@ -1139,6 +1084,31 @@ def gap_weighted_pairwise_rank_loss(scores, regrets, valid_mask, margin=0.05, ga
         score_gap = score[:, None] - score[None, :]
         weighted_loss = F.relu(float(margin) - score_gap) * pair_weight
         losses.append(weighted_loss.sum() / pair_weight.sum().clamp(min=float(eps)))
+
+    if not losses:
+        return scores.new_tensor(0.0)
+    return torch.stack(losses).mean()
+
+
+def oracle_topk_listwise_loss(scores, regrets, valid_mask, topk_count, temperature=0.25):
+    """Put critic softmax mass on the oracle top-regret labeled tokens."""
+    losses = []
+    temperature = max(float(temperature), 1e-6)
+    for b in range(scores.shape[0]):
+        keep = valid_mask[b].bool()
+        valid_count = int(keep.sum().item())
+        if valid_count < 2:
+            continue
+        if torch.is_tensor(topk_count):
+            count_b = int(topk_count.flatten()[b].item())
+        else:
+            count_b = int(topk_count)
+        k = max(1, min(count_b, valid_count))
+        score = scores[b][keep] / temperature
+        regret = regrets[b][keep].detach()
+        oracle_idx = regret.topk(k=k, dim=-1).indices
+        log_probs = F.log_softmax(score, dim=-1)
+        losses.append(-log_probs.gather(dim=-1, index=oracle_idx).mean())
 
     if not losses:
         return scores.new_tensor(0.0)
@@ -1211,7 +1181,6 @@ def maskgen_denoise_step(
     randomize_temperature,
     sample_aesthetic_score,
     softmax_temperature_annealing,
-    refine_softmax_temperature,
     guidance_decay,
     guidance_decay_scale_pow,
     prob_sorting,
@@ -1239,7 +1208,6 @@ def maskgen_denoise_step(
             randomize_temperature=randomize_temperature,
             sample_aesthetic_score=sample_aesthetic_score,
             softmax_temperature_annealing=softmax_temperature_annealing,
-            refine_softmax_temperature=refine_softmax_temperature,
             guidance_decay=guidance_decay,
             guidance_decay_scale_pow=guidance_decay_scale_pow,
             prob_sorting=prob_sorting,
@@ -1268,7 +1236,7 @@ def maskgen_denoise_step(
     if bool(softmax_temperature_annealing):
         softmax_temperature = 0.5 + 0.8 * (1.0 - ratio)
     else:
-        softmax_temperature = max(float(refine_softmax_temperature), 1e-6)
+        softmax_temperature = max(float(annealed_temp), 1e-6)
     logits_for_sample = logits / float(softmax_temperature)
     if 0 <= mask_token_id < logits_for_sample.shape[-1]:
         logits_for_sample[..., mask_token_id] = -1e9
@@ -1317,7 +1285,6 @@ def _rollout_maskgen_steps(
     randomize_temperature=1.5,
     sample_aesthetic_score=6.5,
     softmax_temperature_annealing=True,
-    refine_softmax_temperature=0.7,
     guidance_decay="cosine",
     guidance_decay_scale_pow=1.0,
     prob_sorting=True,
@@ -1344,7 +1311,6 @@ def _rollout_maskgen_steps(
             randomize_temperature=randomize_temperature,
             sample_aesthetic_score=sample_aesthetic_score,
             softmax_temperature_annealing=softmax_temperature_annealing,
-            refine_softmax_temperature=refine_softmax_temperature,
             guidance_decay=guidance_decay,
             guidance_decay_scale_pow=guidance_decay_scale_pow,
             prob_sorting=prob_sorting,
@@ -1477,7 +1443,6 @@ def build_rollout_state(
     randomize_temperature,
     sample_aesthetic_score,
     num_sample_steps,
-    refine_softmax_temperature,
     guidance_decay,
     guidance_decay_scale_pow,
     prob_sorting,
@@ -1540,7 +1505,6 @@ def build_rollout_state(
             randomize_temperature=randomize_temperature,
             sample_aesthetic_score=sample_aesthetic_score,
             softmax_temperature_annealing=softmax_temperature_annealing,
-            refine_softmax_temperature=refine_softmax_temperature,
             guidance_decay=guidance_decay,
             guidance_decay_scale_pow=guidance_decay_scale_pow,
             prob_sorting=prob_sorting,
@@ -1568,7 +1532,6 @@ def generate_wrapper(
     remask_ratio=0.05,
     refine_start_step=10,
     critic_use_hidden=True,
-    refine_softmax_temperature=0.7,
     softmax_temperature_annealing=True,
     guidance_decay="cosine",
     guidance_decay_scale_pow=1.0,
@@ -1635,7 +1598,6 @@ def generate_wrapper(
             randomize_temperature=randomize_temperature,
             sample_aesthetic_score=official_aesthetic_score,
             softmax_temperature_annealing=softmax_temperature_annealing,
-            refine_softmax_temperature=refine_softmax_temperature,
             guidance_decay=guidance_decay,
             guidance_decay_scale_pow=guidance_decay_scale_pow,
             prob_sorting=prob_sorting,
@@ -1697,7 +1659,6 @@ def generate_image_vq_batch(
     remask_ratio=0.05,
     refine_start_step=10,
     critic_use_hidden=True,
-    refine_softmax_temperature=0.7,
     repair_greedy=False,
     refine_loops=None,
 ):
@@ -1725,7 +1686,6 @@ def generate_image_vq_batch(
         refine_start_step=refine_start_step,
         refine_loops=refine_loops,
         critic_use_hidden=bool(critic_use_hidden),
-        refine_softmax_temperature=refine_softmax_temperature,
         repair_greedy=bool(repair_greedy),
     ).to(model_device)
     text_guidance = prepare_text_guidance(prompts, clip_tokenizer, clip_encoder, model_device)
@@ -1821,6 +1781,454 @@ def _merge_fixed_training_subset_manifests(output_dir, world_size):
         for row in rows:
             f.write(json.dumps(row, sort_keys=True) + "\n")
     return merged_manifest_path, len(rows)
+
+
+def _resolve_label_cache_path(config, rank=0, world_size=1):
+    """Resolve the fixed counterfactual label cache path for this run."""
+    path = str(getattr(config.training, "label_cache_path", "") or "").strip()
+    if not path:
+        path = os.path.join(str(config.experiment.output_dir), "label_cache.pt")
+    if not os.path.isabs(path):
+        path = os.path.join(PROJECT_ROOT, path)
+    path = os.path.abspath(os.path.expanduser(path))
+    if int(world_size) > 1:
+        root, ext = os.path.splitext(path)
+        path = f"{root}.rank{int(rank)}{ext or '.pt'}"
+    return path
+
+
+def _resolve_label_cache_timesteps(training, model_cfg):
+    """Resolve configured absolute MaskGen step indices for fixed label cache construction."""
+    raw = getattr(training, "label_cache_timesteps", None)
+    if raw is None:
+        start = int(training.train_refine_start_step)
+        loops = _resolve_refine_loop_count(int(training.refine_loops), start, int(model_cfg.sample_steps))
+        return list(range(start, start + loops))
+    timesteps = [int(x) for x in list(raw)]
+    if not timesteps:
+        raise ValueError("training.label_cache_timesteps must contain at least one timestep.")
+    max_step = int(model_cfg.sample_steps) - 1
+    out = []
+    for step in timesteps:
+        if step < 0 or step > max_step:
+            raise ValueError(
+                f"Invalid label cache timestep {step}; expected 0 <= step <= {max_step}."
+            )
+        out.append(step)
+    return out
+
+
+def _select_label_cache_positions(z_t, model, selection):
+    """Select deterministic token positions for fixed label-cache supervision."""
+    name = str(selection or "all_visible").strip().lower()
+    candidate_mask = z_t.ne(int(model.mask_token_id))
+    if name in {"all_visible", "all", "visible"}:
+        bsz, seq_len = z_t.shape
+        idx = torch.arange(seq_len, device=z_t.device, dtype=torch.long).unsqueeze(0).expand(bsz, -1)
+        return idx, candidate_mask.bool()
+    raise ValueError(
+        f"Unsupported training.label_cache_selection={selection!r}. "
+        "Currently supported: 'all_visible'."
+    )
+
+
+def _resolve_streaming_label_cache_dir(cache_path):
+    """Resolve the directory used by row-wise streaming label caches."""
+    root, ext = os.path.splitext(str(cache_path))
+    if ext:
+        return f"{root}_rows"
+    return f"{cache_path}_rows"
+
+
+def _label_cache_row_name(source_index, fixed_step):
+    """Stable row filename for one fixed image/timestep cache item."""
+    return f"source_{int(source_index):08d}.step_{int(fixed_step):04d}.pt"
+
+
+def _label_cache_expected_row_paths(stream_dir, num_images, timesteps):
+    rows_dir = os.path.join(stream_dir, "rows")
+    out = []
+    for source_index in range(int(num_images)):
+        for fixed_step in timesteps:
+            out.append(os.path.join(rows_dir, _label_cache_row_name(source_index, fixed_step)))
+    return out
+
+
+def _write_json_atomic(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _save_label_cache_row_atomic(path, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    torch.save(row, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _load_streaming_label_cache(
+    cache_path,
+    *,
+    require_complete=True,
+    expected_num_images=None,
+    expected_timesteps=None,
+):
+    """Load metadata and row paths for a row-wise label cache without reading every row."""
+    stream_dir = _resolve_streaming_label_cache_dir(cache_path)
+    metadata_path = os.path.join(stream_dir, "metadata.json")
+    if not os.path.isfile(metadata_path):
+        return None
+
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+
+    timesteps = (
+        [int(x) for x in expected_timesteps]
+        if expected_timesteps is not None
+        else [int(x) for x in metadata.get("timesteps", [])]
+    )
+    num_images = (
+        int(expected_num_images)
+        if expected_num_images is not None
+        else int(metadata.get("num_images", 0))
+    )
+    row_paths = _label_cache_expected_row_paths(
+        stream_dir,
+        num_images=num_images,
+        timesteps=timesteps,
+    )
+    existing_row_paths = [path for path in row_paths if os.path.isfile(path)]
+    complete = len(existing_row_paths) == len(row_paths)
+    if require_complete and not complete:
+        return None
+
+    metadata = dict(metadata)
+    metadata["num_images"] = int(num_images)
+    metadata["timesteps"] = [int(x) for x in timesteps]
+    metadata["num_rows"] = int(len(row_paths))
+    metadata["completed_rows"] = int(len(existing_row_paths))
+    metadata["complete"] = bool(complete)
+    return {
+        "version": 2,
+        "streaming": True,
+        "cache_dir": stream_dir,
+        "metadata": metadata,
+        "row_paths": row_paths if complete else existing_row_paths,
+    }
+
+
+def _streaming_label_cache_progress(cache_path, *, expected_num_images=None, expected_timesteps=None):
+    payload = _load_streaming_label_cache(
+        cache_path,
+        require_complete=False,
+        expected_num_images=expected_num_images,
+        expected_timesteps=expected_timesteps,
+    )
+    if payload is None:
+        return None
+    metadata = payload.get("metadata", {})
+    return {
+        "cache_dir": payload.get("cache_dir", _resolve_streaming_label_cache_dir(cache_path)),
+        "completed_rows": int(metadata.get("completed_rows", 0)),
+        "num_rows": int(metadata.get("num_rows", 0)),
+        "complete": bool(metadata.get("complete", False)),
+    }
+
+
+@torch.no_grad()
+def _build_fixed_label_cache(
+    *,
+    cache_path,
+    images,
+    captions,
+    tokenizer,
+    model,
+    clip_tokenizer,
+    clip_encoder,
+    empty_condition,
+    empty_condition_pooled,
+    device,
+    training,
+    model_cfg,
+    timesteps,
+    rank,
+):
+    """Build a deterministic fixed rollout-state/counterfactual-regret cache on CPU."""
+    if len(captions) == 0:
+        raise ValueError("Cannot build label cache with an empty fixed training subset.")
+
+    batch_size = max(1, int(training.per_gpu_batch_size))
+    selection = str(getattr(training, "label_cache_selection", "all_visible"))
+    streaming = bool(getattr(training, "label_cache_streaming", True))
+    force_rebuild = bool(getattr(training, "rebuild_label_cache", False))
+    stream_dir = _resolve_streaming_label_cache_dir(cache_path)
+    rows_dir = os.path.join(stream_dir, "rows")
+    metadata = {
+        "rank": int(rank),
+        "num_rows": int(len(captions) * len(timesteps)),
+        "completed_rows": 0,
+        "num_images": int(len(captions)),
+        "timesteps": [int(x) for x in timesteps],
+        "selection": selection,
+        "image_seq_len": int(model.image_seq_len),
+        "mask_token_id": int(model.mask_token_id),
+        "counterfactual_rollout_steps": int(training.counterfactual_rollout_steps),
+        "counterfactual_utility": str(training.counterfactual_utility),
+        "regret_target_transform": str(training.regret_target_transform),
+        "streaming": bool(streaming),
+    }
+    if streaming:
+        _write_json_atomic(os.path.join(stream_dir, "metadata.json"), metadata)
+
+    cache_rows = [] if not streaming else None
+    iterator = list(_iter_fixed_subset_batches(images, captions, batch_size=batch_size))
+    total = len(iterator) * len(timesteps)
+    completed_state_batches = 0
+    if streaming and not force_rebuild:
+        for batch_start, (_, batch_captions) in enumerate(iterator):
+            source_start = batch_start * batch_size
+            for fixed_step in timesteps:
+                expected = [
+                    os.path.join(rows_dir, _label_cache_row_name(source_start + local_idx, fixed_step))
+                    for local_idx in range(len(batch_captions))
+                ]
+                if expected and all(os.path.isfile(path) for path in expected):
+                    completed_state_batches += 1
+
+    pbar = tqdm(
+        total=total,
+        initial=completed_state_batches,
+        desc="label-cache",
+        unit="state-batch",
+        disable=not is_main_process(),
+    )
+
+    for batch_start, (batch_images, batch_captions) in enumerate(iterator):
+        if len(batch_captions) == 0:
+            continue
+        batch_size_actual = len(batch_captions)
+        source_start = batch_start * batch_size
+        gt_tokens = images_to_tokens(tokenizer, batch_images).to(device, non_blocking=True)
+        condition, condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, batch_captions)
+        condition = condition.to(device, non_blocking=True)
+        condition_pooled = condition_pooled.to(device, non_blocking=True)
+        none_condition = empty_condition.expand(batch_size_actual, -1, -1)
+        none_condition_pooled = empty_condition_pooled.expand(batch_size_actual, -1, -1)
+
+        for fixed_step in timesteps:
+            existing_row_paths = [
+                os.path.join(rows_dir, _label_cache_row_name(source_start + local_idx, fixed_step))
+                for local_idx in range(batch_size_actual)
+            ]
+            if (
+                streaming
+                and not force_rebuild
+                and existing_row_paths
+                and all(os.path.isfile(path) for path in existing_row_paths)
+            ):
+                continue
+
+            z_t, timestep_values, rollout_step_indices = build_rollout_state(
+                model=model,
+                condition=condition,
+                condition_pooled=condition_pooled,
+                none_condition=none_condition,
+                none_condition_pooled=none_condition_pooled,
+                device=device,
+                batch_size=batch_size_actual,
+                guidance_scale=float(training.train_guidance_scale),
+                randomize_temperature=float(training.train_randomize_temperature),
+                sample_aesthetic_score=float(training.train_aesthetic_score),
+                num_sample_steps=int(model_cfg.sample_steps),
+                refine_loops=int(training.refine_loops),
+                refine_start_step=int(training.train_refine_start_step),
+                repair_greedy=bool(training.train_repair_greedy),
+                fixed_step=int(fixed_step),
+                rollout_step_schedule="cycle",
+                rollout_cycle_index=0,
+                guidance_decay="cosine",
+                guidance_decay_scale_pow=1.0,
+                prob_sorting=True,
+            )
+            selected_idx, selected_valid = _select_label_cache_positions(
+                z_t,
+                model=model,
+                selection=selection,
+            )
+            counterfactual_regrets, regret_valid = compute_counterfactual_regret(
+                model=model,
+                gt_tokens=gt_tokens,
+                z_t=z_t,
+                condition=condition,
+                condition_pooled=condition_pooled,
+                timesteps=timestep_values,
+                step_indices=rollout_step_indices,
+                selected_idx=selected_idx,
+                selected_valid=selected_valid,
+                sample_aesthetic_score=float(training.train_aesthetic_score),
+                counterfactual_chunk_size=int(training.counterfactual_chunk_size),
+                counterfactual_rollout_steps=int(training.counterfactual_rollout_steps),
+                counterfactual_utility=str(training.counterfactual_utility),
+                counterfactual_contrast_negatives=int(training.counterfactual_contrast_negatives),
+                counterfactual_contrast_temperature=float(training.counterfactual_contrast_temperature),
+                counterfactual_contrast_mode=str(training.counterfactual_contrast_mode),
+                num_sample_steps=int(model_cfg.sample_steps),
+                guidance_scale=float(training.train_guidance_scale),
+                randomize_temperature=float(training.train_randomize_temperature),
+                guidance_decay="cosine",
+                guidance_decay_scale_pow=1.0,
+                softmax_temperature_annealing=False,
+                prob_sorting=True,
+                repair_greedy=bool(training.counterfactual_repair_greedy),
+                none_condition=none_condition,
+                none_condition_pooled=none_condition_pooled,
+            )
+            for local_idx, caption in enumerate(batch_captions):
+                source_index = int(source_start + local_idx)
+                row = {
+                    "caption": str(caption),
+                    "source_index": source_index,
+                    "fixed_step": int(fixed_step),
+                    "z_t": z_t[local_idx].to("cpu", dtype=torch.long),
+                    "timestep": timestep_values[local_idx].to("cpu", dtype=torch.float32),
+                    "step_index": rollout_step_indices[local_idx].to("cpu", dtype=torch.long),
+                    "selected_idx": selected_idx[local_idx].to("cpu", dtype=torch.long),
+                    "selected_valid": selected_valid[local_idx].to("cpu", dtype=torch.bool),
+                    "counterfactual_regrets": counterfactual_regrets[local_idx].to("cpu", dtype=torch.float32),
+                    "regret_valid": regret_valid[local_idx].to("cpu", dtype=torch.bool),
+                }
+                if streaming:
+                    row_path = os.path.join(rows_dir, _label_cache_row_name(source_index, fixed_step))
+                    _save_label_cache_row_atomic(row_path, row)
+                else:
+                    cache_rows.append(row)
+            pbar.update(1)
+
+    pbar.close()
+    if streaming:
+        final_metadata = dict(metadata)
+        final_metadata["completed_rows"] = int(metadata["num_rows"])
+        final_metadata["complete"] = True
+        _write_json_atomic(os.path.join(stream_dir, "metadata.json"), final_metadata)
+        payload = _load_streaming_label_cache(cache_path, require_complete=True)
+        if payload is None:
+            partial = _load_streaming_label_cache(cache_path, require_complete=False)
+            completed = 0 if partial is None else int(partial.get("metadata", {}).get("completed_rows", 0))
+            raise RuntimeError(
+                f"Streaming fixed label cache is incomplete: {completed}/{metadata['num_rows']} rows in {stream_dir}"
+            )
+        return payload
+
+    if not cache_rows:
+        raise RuntimeError("Fixed label cache construction produced no rows.")
+
+    payload = {
+        "version": 1,
+        "metadata": metadata,
+        "rows": cache_rows,
+    }
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    torch.save(payload, cache_path)
+    return payload
+
+
+def _load_or_build_fixed_label_cache(
+    *,
+    config,
+    images,
+    captions,
+    tokenizer,
+    model,
+    clip_tokenizer,
+    clip_encoder,
+    empty_condition,
+    empty_condition_pooled,
+    device,
+    rank,
+    world_size,
+):
+    """Load an existing fixed label cache, or build it from the fixed subset."""
+    cache_path = _resolve_label_cache_path(config, rank=rank, world_size=world_size)
+    rebuild = bool(getattr(config.training, "rebuild_label_cache", False))
+    streaming = bool(getattr(config.training, "label_cache_streaming", True))
+    timesteps = _resolve_label_cache_timesteps(config.training, config.model)
+    if streaming and not rebuild:
+        payload = _load_streaming_label_cache(
+            cache_path,
+            require_complete=True,
+            expected_num_images=len(captions),
+            expected_timesteps=timesteps,
+        )
+        if payload is not None:
+            return payload, payload.get("cache_dir", cache_path), False
+        progress = _streaming_label_cache_progress(
+            cache_path,
+            expected_num_images=len(captions),
+            expected_timesteps=timesteps,
+        )
+        if progress is not None and is_main_process():
+            print(
+                "Resuming partial streaming fixed label cache: "
+                f"{progress['cache_dir']} "
+                f"({progress['completed_rows']}/{progress['num_rows']} rows)"
+            )
+        elif os.path.isfile(cache_path):
+            payload = torch.load(cache_path, map_location="cpu")
+            return payload, cache_path, False
+        elif is_main_process():
+            print(
+                "No complete fixed label cache found at "
+                f"{_resolve_streaming_label_cache_dir(cache_path)} or {cache_path}; building it."
+            )
+    if os.path.isfile(cache_path) and not rebuild:
+        payload = torch.load(cache_path, map_location="cpu")
+        return payload, cache_path, False
+    payload = _build_fixed_label_cache(
+        cache_path=cache_path,
+        images=images,
+        captions=captions,
+        tokenizer=tokenizer,
+        model=model,
+        clip_tokenizer=clip_tokenizer,
+        clip_encoder=clip_encoder,
+        empty_condition=empty_condition,
+        empty_condition_pooled=empty_condition_pooled,
+        device=device,
+        training=config.training,
+        model_cfg=config.model,
+        timesteps=timesteps,
+        rank=rank,
+    )
+    return payload, payload.get("cache_dir", cache_path) if isinstance(payload, dict) else cache_path, True
+
+
+def _iter_fixed_label_cache_batches(label_cache, batch_size):
+    """Yield mini-batches from a fixed label cache payload."""
+    if bool(label_cache.get("streaming", False)):
+        rows = list(label_cache.get("row_paths", []))
+    else:
+        rows = list(label_cache.get("rows", []))
+    batch_size = max(1, int(batch_size))
+    for start in range(0, len(rows), batch_size):
+        part = rows[start:start + batch_size]
+        if not part:
+            continue
+        if bool(label_cache.get("streaming", False)):
+            part = [torch.load(path, map_location="cpu") for path in part]
+        yield {
+            "captions": [row["caption"] for row in part],
+            "z_t": torch.stack([row["z_t"] for row in part], dim=0),
+            "timesteps": torch.stack([row["timestep"] for row in part], dim=0).view(-1),
+            "rollout_step_indices": torch.stack([row["step_index"] for row in part], dim=0).view(-1),
+            "selected_idx": torch.stack([row["selected_idx"] for row in part], dim=0),
+            "selected_valid": torch.stack([row["selected_valid"] for row in part], dim=0),
+            "counterfactual_regrets": torch.stack([row["counterfactual_regrets"] for row in part], dim=0),
+            "regret_valid": torch.stack([row["regret_valid"] for row in part], dim=0),
+        }
 
 
 def main():
@@ -2008,13 +2416,52 @@ def main():
     empty_condition = empty_condition.to(device, non_blocking=True)
     empty_condition_pooled = empty_condition_pooled.to(device, non_blocking=True)
 
+    fixed_label_cache_enabled = bool(getattr(training, "fixed_label_cache", False))
+    label_cache_payload = None
+    if fixed_label_cache_enabled:
+        if max_train_images <= 0 or fixed_subset_images is None or fixed_subset_captions is None:
+            raise ValueError("training.fixed_label_cache=True requires training.max_train_images > 0.")
+        label_cache_payload, label_cache_path, label_cache_built = _load_or_build_fixed_label_cache(
+            config=config,
+            images=fixed_subset_images,
+            captions=fixed_subset_captions,
+            tokenizer=tokenizer,
+            model=model,
+            clip_tokenizer=clip_tokenizer,
+            clip_encoder=clip_encoder,
+            empty_condition=empty_condition,
+            empty_condition_pooled=empty_condition_pooled,
+            device=device,
+            rank=rank,
+            world_size=world_size,
+        )
+        label_cache_rows = int(label_cache_payload.get("metadata", {}).get("num_rows", len(label_cache_payload.get("rows", []))))
+        cache_steps_per_epoch = max(1, int(math.ceil(label_cache_rows / max(1, int(training.per_gpu_batch_size)))))
+        cache_total_steps = int(start_step) + cache_steps_per_epoch * int(training.num_epochs)
+        total_steps = cache_total_steps if stop_step is None else min(stop_step, cache_total_steps)
+        pbar.total = total_steps
+        pbar.refresh()
+        if is_main_process():
+            action = "Built" if label_cache_built else "Loaded"
+            print(
+                f"{action} fixed label cache: {label_cache_path} "
+                f"({label_cache_rows} state rows, {cache_steps_per_epoch} steps/epoch)"
+            )
+            if tb_logger is not None:
+                tb_logger.log_text("dataset/fixed_label_cache", label_cache_path, step=start_step)
+
     if int(dataset_cfg.stream_prefetch_batches) > 0:
         stream_prefetch_batches = int(dataset_cfg.stream_prefetch_batches)
     else:
         stream_prefetch_batches = max(1, min(8, max(2, int(training.per_gpu_batch_size) // 64)))
 
     for _ in range(int(training.num_epochs)):
-        if max_train_images > 0:
+        if fixed_label_cache_enabled:
+            stream = _iter_fixed_label_cache_batches(
+                label_cache_payload,
+                batch_size=int(training.per_gpu_batch_size),
+            )
+        elif max_train_images > 0:
             stream = _iter_fixed_subset_batches(
                 fixed_subset_images,
                 fixed_subset_captions,
@@ -2030,52 +2477,119 @@ def main():
                 batch_iter,
                 prefetch_batches=stream_prefetch_batches,
             )
-        for images, captions in stream:
+        for batch in stream:
             if stop_step is not None and step >= stop_step:
                 break
-            batch_size = len(captions)
-            if batch_size <= 0:
-                continue
-            gt_tokens = images_to_tokens(tokenizer, images).to(device, non_blocking=True)
+            if fixed_label_cache_enabled:
+                captions = batch["captions"]
+                batch_size = len(captions)
+                if batch_size <= 0:
+                    continue
+                z_t = batch["z_t"].to(device, non_blocking=True)
+                timesteps = batch["timesteps"].to(device, non_blocking=True)
+                rollout_step_indices = batch["rollout_step_indices"].to(device, non_blocking=True)
+                selected_idx = batch["selected_idx"].to(device, non_blocking=True)
+                selected_valid = batch["selected_valid"].to(device, non_blocking=True)
+                counterfactual_regrets = batch["counterfactual_regrets"].to(device, non_blocking=True)
+                regret_valid = batch["regret_valid"].to(device, non_blocking=True)
+
+                with torch.no_grad():
+                    condition, condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, captions)
+                    condition = condition.to(device, non_blocking=True)
+                    condition_pooled = condition_pooled.to(device, non_blocking=True)
+                    none_condition = empty_condition.expand(batch_size, -1, -1)
+                    none_condition_pooled = empty_condition_pooled.expand(batch_size, -1, -1)
+
+            else:
+                images, captions = batch
+                batch_size = len(captions)
+                if batch_size <= 0:
+                    continue
+                gt_tokens = images_to_tokens(tokenizer, images).to(device, non_blocking=True)
+
+                with torch.no_grad():
+                    # Match inference-side text conditioning (no training-time text dropout).
+                    # This part is exactly the same as the beginning of `generate_wrapper()`; I got from MaskGen_VQ.generate() but without the generation loop.
+                    condition, condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, captions)
+                    condition = condition.to(device, non_blocking=True)
+                    condition_pooled = condition_pooled.to(device, non_blocking=True)
+                    none_condition = empty_condition.expand(batch_size, -1, -1)
+                    none_condition_pooled = empty_condition_pooled.expand(batch_size, -1, -1)
+
+                    # Build the partially denoised token state for the current training step,
+                    # by simulating forward from the all-mask state up to a random refinement step.
+                    z_t, timesteps, rollout_step_indices = build_rollout_state(
+                        model=model,
+                        condition=condition,
+                        condition_pooled=condition_pooled,
+                        none_condition=none_condition,
+                        none_condition_pooled=none_condition_pooled,
+                        device=device,
+                        batch_size=batch_size,
+                        guidance_scale=float(training.train_guidance_scale),
+                        randomize_temperature=float(training.train_randomize_temperature),
+                        sample_aesthetic_score=float(training.train_aesthetic_score),
+                        num_sample_steps=int(model_cfg.sample_steps),
+                        refine_loops=int(training.refine_loops),
+                        refine_start_step=int(training.train_refine_start_step),
+                        repair_greedy=train_repair_greedy,
+                        fixed_step=fixed_rollout_step_arg,
+                        rollout_step_schedule=rollout_step_schedule,
+                        rollout_cycle_index=step,
+                        guidance_decay="cosine",
+                        guidance_decay_scale_pow=1.0,
+                        prob_sorting=True,
+                    )
+
+                    # The critic only needs labels for a budget-sized subset of visible tokens.
+                    # Tying the sampled subset to the remask budget keeps training aligned with inference
+                    # while avoiding the prohibitively expensive all-visible-token counterfactual sweep.
+                    base_candidate_mask = z_t.ne(int(model.mask_token_id))
+                    train_label_budget = _resolve_schedule_remask_count(
+                        model,
+                        timesteps,
+                        budget_fraction=float(training.train_remask_ratio),
+                    )
+                    selected_idx, selected_valid = select_budget_token_positions(
+                        base_candidate_mask,
+                        budget_count=train_label_budget,
+                        multiplier=float(getattr(training, "counterfactual_train_budget_multiplier", 1.0)),
+                        min_tokens=1,
+                    )
+
+                    counterfactual_regrets, regret_valid = compute_counterfactual_regret(
+                        model=model,
+                        gt_tokens=gt_tokens,
+                        z_t=z_t,
+                        condition=condition,
+                        condition_pooled=condition_pooled,
+                        timesteps=timesteps,
+                        step_indices=rollout_step_indices,
+                        selected_idx=selected_idx,
+                        selected_valid=selected_valid,
+                        sample_aesthetic_score=float(training.train_aesthetic_score),
+                        counterfactual_chunk_size=int(training.counterfactual_chunk_size),
+                        counterfactual_rollout_steps=int(training.counterfactual_rollout_steps),
+                        counterfactual_utility=str(training.counterfactual_utility),
+                        counterfactual_contrast_negatives=int(training.counterfactual_contrast_negatives),
+                        counterfactual_contrast_temperature=float(training.counterfactual_contrast_temperature),
+                        counterfactual_contrast_mode=str(training.counterfactual_contrast_mode),
+                        num_sample_steps=int(model_cfg.sample_steps),
+                        guidance_scale=float(training.train_guidance_scale),
+                        randomize_temperature=float(training.train_randomize_temperature),
+                        guidance_decay="cosine",
+                        guidance_decay_scale_pow=1.0,
+                        softmax_temperature_annealing=False,
+                        prob_sorting=True,
+                        repair_greedy=bool(training.counterfactual_repair_greedy),
+                        none_condition=none_condition,
+                        none_condition_pooled=none_condition_pooled,
+                    )
 
             with torch.no_grad():
-                # Match inference-side text conditioning (no training-time text dropout).
-                # This part is exactly the same as the beginning of `generate_wrapper()`; I got from MaskGen_VQ.generate() but without the generation loop.
-                condition, condition_pooled = open_clip_text_encoding(clip_tokenizer, clip_encoder, captions)
-                condition = condition.to(device, non_blocking=True)
-                condition_pooled = condition_pooled.to(device, non_blocking=True)
-                none_condition = empty_condition.expand(batch_size, -1, -1)
-                none_condition_pooled = empty_condition_pooled.expand(batch_size, -1, -1)
-
-                # Build the partially denoised token state for the current training step, 
-                # by simulating forward from the all-mask state up to a random refinement step.
-                z_t, timesteps, rollout_step_indices = build_rollout_state(
-                    model=model,
-                    condition=condition,
-                    condition_pooled=condition_pooled,
-                    none_condition=none_condition,
-                    none_condition_pooled=none_condition_pooled,
-                    device=device,
-                    batch_size=batch_size,
-                    guidance_scale=float(training.train_guidance_scale),
-                    randomize_temperature=float(training.train_randomize_temperature),
-                    sample_aesthetic_score=float(training.train_aesthetic_score),
-                    num_sample_steps=int(model_cfg.sample_steps),
-                    refine_loops=int(training.refine_loops),
-                    refine_start_step=int(training.train_refine_start_step),
-                    repair_greedy=train_repair_greedy,
-                    fixed_step=fixed_rollout_step_arg,
-                    rollout_step_schedule=rollout_step_schedule,
-                    rollout_cycle_index=step,
-                    refine_softmax_temperature=0.7,
-                    guidance_decay="cosine",
-                    guidance_decay_scale_pow=1.0,
-                    prob_sorting=True,
-                )
-
                 # This is a per-token, per-vocab “how much did the prompt change the model’s preference?” tensor.
                 # prompt_logits_delta_orig tells the critic which predictions are specifically supported by the prompt, rather than just being generic image priors.
-                use_prompt_gap_features = training.critic_prompt_gap_topk  > 0
+                use_prompt_gap_features = training.critic_prompt_gap_topk > 0
                 if use_prompt_gap_features:
                     logits_orig, hidden_orig, text_feat, cond_logits_orig, uncond_logits_orig = forward_maskgen(
                         model=model,
@@ -2108,51 +2622,7 @@ def main():
                         none_condition_pooled=none_condition_pooled,
                     )
                     prompt_logits_delta_orig = None
-                # The critic only needs labels for a budget-sized subset of visible tokens.
-                # Tying the sampled subset to the remask budget keeps training aligned with inference
-                # while avoiding the prohibitively expensive all-visible-token counterfactual sweep.
                 base_candidate_mask = z_t.ne(int(model.mask_token_id))
-                train_label_budget = _resolve_schedule_remask_count(
-                    model,
-                    timesteps,
-                    budget_fraction=float(training.train_remask_ratio),
-                )
-                selected_idx, selected_valid = select_budget_token_positions(
-                    base_candidate_mask,
-                    budget_count=train_label_budget,
-                    multiplier=float(getattr(training, "counterfactual_train_budget_multiplier", 1.0)),
-                    min_tokens=1,
-                )
-                
-                counterfactual_regrets, regret_valid = compute_counterfactual_regret(
-                    model=model,
-                    gt_tokens=gt_tokens,
-                    z_t=z_t,
-                    condition=condition,
-                    condition_pooled=condition_pooled,
-                    timesteps=timesteps,
-                    step_indices=rollout_step_indices,
-                    selected_idx=selected_idx,
-                    selected_valid=selected_valid,
-                    sample_aesthetic_score=float(training.train_aesthetic_score),
-                    counterfactual_chunk_size=int(training.counterfactual_chunk_size),
-                    counterfactual_rollout_steps=int(training.counterfactual_rollout_steps),
-                    counterfactual_utility=str(training.counterfactual_utility),
-                    counterfactual_contrast_negatives=int(training.counterfactual_contrast_negatives),
-                    counterfactual_contrast_temperature=float(training.counterfactual_contrast_temperature),
-                    counterfactual_contrast_mode=str(training.counterfactual_contrast_mode),
-                    num_sample_steps=int(model_cfg.sample_steps),
-                    guidance_scale=float(training.train_guidance_scale),
-                    randomize_temperature=float(training.train_randomize_temperature),
-                    refine_softmax_temperature=0.7,
-                    guidance_decay="cosine",
-                    guidance_decay_scale_pow=1.0,
-                    softmax_temperature_annealing=False,
-                    prob_sorting=True,
-                    repair_greedy=bool(training.counterfactual_repair_greedy),
-                    none_condition=none_condition,
-                    none_condition_pooled=none_condition_pooled,
-                )
 
             pred_regret = critic(
                 hidden_states=hidden_orig,
@@ -2168,7 +2638,19 @@ def main():
                 valid_mask=regret_valid,
             )
             valid_float = regret_valid.float()
-            loss_mse = ((pred_sel - targets).pow(2) * valid_float).sum() / valid_float.sum().clamp(min=1.0)
+            mse_weights = torch.ones_like(targets)
+            neg_mse_weight = targets.new_tensor(1.0)
+            pos_target_count = targets.new_tensor(0.0)
+            neg_target_count = targets.new_tensor(0.0)
+            if bool(getattr(training, "balance_negative_mse", False)):
+                pos = targets.gt(0.0) & regret_valid.bool()
+                neg = targets.lt(0.0) & regret_valid.bool()
+                pos_target_count = pos.float().sum()
+                neg_target_count = neg.float().sum()
+                neg_mse_weight = pos_target_count / neg_target_count.clamp(min=1.0)
+                mse_weights = torch.where(neg, neg_mse_weight, mse_weights)
+            weighted_valid = mse_weights * valid_float
+            loss_mse = ((pred_sel - targets).pow(2) * weighted_valid).sum() / weighted_valid.sum().clamp(min=1.0)
 
             if training.lambda_rank > 0.0:
                 full_regret_targets = torch.zeros_like(pred_regret)
@@ -2184,8 +2666,32 @@ def main():
                 )
             else:
                 loss_rank = pred_sel.new_tensor(0.0)
-                
-            loss = loss_mse + training.lambda_rank * loss_rank
+
+            lambda_topk = float(getattr(training, "lambda_topk", 0.0))
+            topk_loss_budget_fraction = (
+                float(training.train_remask_ratio)
+                * float(getattr(training, "topk_loss_budget_fraction", 1.0))
+            )
+            topk_loss_budget = torch.tensor(
+                [
+                    _resolve_schedule_remask_count(model, t, budget_fraction=topk_loss_budget_fraction)
+                    for t in timesteps.detach().flatten()
+                ],
+                device=pred_sel.device,
+                dtype=torch.long,
+            )
+            if lambda_topk > 0.0:
+                loss_topk = oracle_topk_listwise_loss(
+                    scores=pred_sel,
+                    regrets=targets,
+                    valid_mask=regret_valid,
+                    topk_count=topk_loss_budget,
+                    temperature=float(getattr(training, "topk_loss_temperature", 0.25)),
+                )
+            else:
+                loss_topk = pred_sel.new_tensor(0.0)
+
+            loss = loss_mse + training.lambda_rank * loss_rank + lambda_topk * loss_topk
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -2243,10 +2749,34 @@ def main():
                     if keep.any()
                     else 0.0
                 )
+                unweighted_loss_mse_value = (
+                    float(((pred_sel_log - targets_log).pow(2) * valid_float).sum().item() / valid_float.sum().clamp(min=1.0).item())
+                    if keep.any()
+                    else 0.0
+                )
+                weighted_valid_log = weighted_valid.detach()
+                weighted_target_mean = (
+                    float((targets_log * weighted_valid_log).sum().item() / weighted_valid_log.sum().clamp(min=1.0).item())
+                    if keep.any()
+                    else 0.0
+                )
+                weighted_constant_target_mse = (
+                    float(
+                        ((targets_log - weighted_target_mean).pow(2) * weighted_valid_log).sum().item()
+                        / weighted_valid_log.sum().clamp(min=1.0).item()
+                    )
+                    if keep.any()
+                    else 0.0
+                )
                 loss_mse_value = float(loss_mse.item())
-                mse_vs_constant_ratio = (loss_mse_value / max(constant_target_mse, 1e-8)) if keep.any() else 0.0
-                constant_baseline_improvement = constant_target_mse - loss_mse_value
-                beats_constant_baseline = float(loss_mse_value < constant_target_mse) if keep.any() else 0.0
+                comparison_constant_mse = (
+                    weighted_constant_target_mse
+                    if bool(getattr(training, "balance_negative_mse", False))
+                    else constant_target_mse
+                )
+                mse_vs_constant_ratio = (loss_mse_value / max(comparison_constant_mse, 1e-8)) if keep.any() else 0.0
+                constant_baseline_improvement = comparison_constant_mse - loss_mse_value
+                beats_constant_baseline = float(loss_mse_value < comparison_constant_mse) if keep.any() else 0.0
                 rollout_step_index = int(rollout_step_indices[0].item()) if rollout_step_indices.numel() > 0 else -1
                 rollout_cycle_position = (
                     float(rollout_step_index - int(training.train_refine_start_step))
@@ -2256,6 +2786,7 @@ def main():
                 pbar.set_postfix({
                     "loss": float(loss.item()),
                     "rank": float(loss_rank.item()),
+                    "topk": float(loss_topk.item()),
                     "corr": float(regret_corr.item()),
                     "t_corr": float(target_corr.item()),
                     "pos_r": regret_positive_fraction,
@@ -2274,13 +2805,24 @@ def main():
                         {
                             "train/loss": float(loss.item()),
                             "train/loss_mse": float(loss_mse.item()),
+                            "train/loss_mse_unweighted": unweighted_loss_mse_value,
                             "train/loss_rank": float(loss_rank.item()),
+                            "train/loss_topk": float(loss_topk.item()),
+                            "train/balance_negative_mse": int(bool(getattr(training, "balance_negative_mse", False))),
+                            "train/negative_mse_weight": float(neg_mse_weight.detach().item()),
+                            "train/positive_target_count": float(pos_target_count.detach().item()),
+                            "train/negative_target_count": float(neg_target_count.detach().item()),
                             "train/lambda_rank": training.lambda_rank,
                             "train/rank_margin": training.rank_margin,
                             "train/rank_gap_threshold": training.rank_gap_threshold,
+                            "train/lambda_topk": lambda_topk,
+                            "train/topk_loss_budget": float(topk_loss_budget.float().mean().item()),
+                            "train/topk_loss_budget_fraction": float(getattr(training, "topk_loss_budget_fraction", 1.0)),
+                            "train/topk_loss_temperature": float(getattr(training, "topk_loss_temperature", 0.25)),
                             "train/regret_corr": float(regret_corr.item()),
                             "train/target_corr": float(target_corr.item()),
                             "train/constant_target_mse": constant_target_mse,
+                            "train/weighted_constant_target_mse": weighted_constant_target_mse,
                             "train/regret_mean": regret_mean,
                             "train/regret_std": regret_std,
                             "train/pred_selected_mean": pred_sel_mean,

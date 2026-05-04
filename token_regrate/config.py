@@ -1,8 +1,9 @@
+from IPython import config
 from ml_collections import config_dict
 import os
 
 # Unified output directory for this config module.
-OUTPUT_DIR = "outputs/token_regret_critic_tanh"
+OUTPUT_DIR = "outputs/token_regret_critic_tanh_ngloss_prompt_cach"
 
 
 def get_config():
@@ -21,13 +22,13 @@ def get_config():
     # Base random seed; each DDP rank uses seed + rank for deterministic-but-distinct streams.
     config.training.seed = 42
     # Number of passes over the configured stream or fixed subset, unless max_steps stops first.
-    config.training.num_epochs = 100
+    config.training.num_epochs = 600
     # Hard cap on optimizer steps after resume; 0 means no explicit step cap.
     config.training.max_steps = 0
     # If >0, collect this many examples once and replay only that fixed subset; 0 uses the full dataset stream.
-    config.training.max_train_images = 10_000
+    config.training.max_train_images = 3072
     # Per-process batch size; total global batch is this value times world_size.
-    config.training.per_gpu_batch_size = 128
+    config.training.per_gpu_batch_size = 256
     # AdamW learning rate for the trainable token-regret critic only; generator/tokenizer stay frozen.
     config.training.learning_rate = 2e-4
     # Number of candidate token counterfactuals evaluated per chunk to control memory use.
@@ -35,7 +36,9 @@ def get_config():
     # Number of plain MaskGen denoise steps rolled forward after each token-remask counterfactual.
     config.training.counterfactual_rollout_steps = 2
     # Utility used to score baseline-vs-counterfactual quality; token-based utilities
-    # consider only the selected token, while full_sequence_* utilities score the whole sequence.
+    # token_ce: "Does this token match the ground-truth image token?"
+    # token_prompt: "Does the correct prompt help more than the unconditional prompt?"
+    # token_contrast: "Does the correct prompt help more than wrong prompts?"
     config.training.counterfactual_utility = "token_prompt"
     # Number of mismatched batch prompts used by contrastive utilities; <=0 uses every available local-batch negative.
     config.training.counterfactual_contrast_negatives = 4
@@ -48,7 +51,7 @@ def get_config():
     # Number of top cond-minus-uncond logit-gap features exposed to the regret critic nn; 0 disables them.
     config.training.critic_prompt_gap_topk = 8
     # Transform raw counterfactual regret targets before MSE; supported: "none"/"tanh"/"zscore".
-    config.training.regret_target_transform = "tanh"
+    config.training.regret_target_transform = "None"
     # Notebook/control flag for DDP-only workflows; the training entrypoint does not currently branch on it.
     config.training.ddp_only = False
     # torch.distributed backend used by torchrun; default to "nccl" for CUDA DDP and fall back to "gloo" in CPU-only runtime setup.
@@ -56,7 +59,7 @@ def get_config():
     # Classifier-free guidance scale used when building training states and counterfactual logits.
     config.training.train_guidance_scale = 12.0
     # Gumbel/random sampling temperature for training-state and counterfactual denoising; 0 makes it deterministic.
-    config.training.train_randomize_temperature = 0.0
+    config.training.train_randomize_temperature = 1.0
     # Aesthetic conditioning scalar passed to MaskGen when the generator has micro-conditioning.
     config.training.train_aesthetic_score = 6.5
     # Fraction of the current MaskGen schedule mask budget that the critic may re-mask at guided steps.
@@ -64,8 +67,20 @@ def get_config():
     # Number of token counterfactual labels to sample per example, expressed as a multiple of the critic remask budget.
     # Values >1 keep supervision broader than inference while avoiding all-visible-token labeling.
     config.training.counterfactual_train_budget_multiplier = 2.0
+    # Debug/supervised mode: build or load a fixed counterfactual label cache so each epoch trains on
+    # identical rollout states, selected token positions, and regret targets.
+    config.training.fixed_label_cache = True
+    config.training.label_cache_path = os.path.join(OUTPUT_DIR, "label_cache.pt")
+    # Write each cached (image, timestep) row as its own file while building. Interrupted cache builds resume
+    # from the rows already saved in the sibling label_cache_rows directory.
+    config.training.label_cache_streaming = True
+    config.training.rebuild_label_cache = False
+    config.training.label_cache_timesteps = [ 11, 12, 13, 14, 15 ]
+    # "all_visible" labels every visible token in each cached rollout state. This is best for small debug subsets.
+    config.training.label_cache_selection = "all_visible"
     # First sample step index where critic-guided refinement is allowed.
-    config.training.train_refine_start_step = 8
+    # Keep this aligned with the first fixed label-cache timestep.
+    config.training.train_refine_start_step = 11
     # Use argmax instead of Gumbel sampling while simulating the training-time MaskGen trajectory.
     config.training.train_repair_greedy = True
     # How to choose rollout decision steps when fixed_rollout_step < 0: "cycle" visits each step in order,
@@ -75,18 +90,28 @@ def get_config():
     config.training.fixed_rollout_step = -1
     # Max gradient norm for critic parameters; <=0 disables gradient clipping.
     config.training.grad_clip_norm = 1.0
+    # Upweight negative-regret labels in the regression loss so the critic learns the zero boundary
+    # instead of predicting a mildly positive score for almost every token.
+    config.training.balance_negative_mse = True
     # Weight on the auxiliary pairwise ranking loss; 0 trains only the MSE regret regression loss.
     config.training.lambda_rank = 0.05
     # Margin used by the pairwise ranking loss when lambda_rank > 0.
     config.training.rank_margin = 0.0
     # Minimum target-regret gap required for a token pair to contribute to ranking loss.
     config.training.rank_gap_threshold = 0.1
+    # Listwise oracle-top-k loss weight. This directly encourages the critic to place high
+    # probability mass on the true top-regret visible tokens, improving top-k recall.
+    config.training.lambda_topk = 0.05
+    # Fraction of the current remask budget used as oracle positives for the listwise top-k loss.
+    config.training.topk_loss_budget_fraction = 1.0
+    # Softmax temperature for critic scores in the listwise top-k loss.
+    config.training.topk_loss_temperature = 0.25
     # EMA decay for the frozen target critic; closer to 1 updates it more slowly.
     config.training.target_critic_ema_decay = 0.995
     # Number of critic-guided decision steps after train_refine_start_step.
     config.training.refine_loops = 5
     # Save critic_step_N.pt and critic_last.pt every this many optimizer steps on rank 0.
-    config.training.save_every = 1
+    config.training.save_every = 100
     # Log metrics every this many optimizer steps on rank 0.
     config.training.log_every = 1
 

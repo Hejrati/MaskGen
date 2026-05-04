@@ -143,7 +143,6 @@ def _prepare_generation_config(
     refine_start_step,
     refine_loops,
     critic_use_hidden,
-    refine_softmax_temperature,
     repair_greedy,
     attention_backend,
     clip_force_quick_gelu,
@@ -163,7 +162,6 @@ def _prepare_generation_config(
         "refine_start_step": int(refine_start_step),
         "refine_loops": _none_or_int(refine_loops),
         "critic_use_hidden": bool(critic_use_hidden),
-        "refine_softmax_temperature": float(refine_softmax_temperature),
         "repair_greedy": bool(repair_greedy),
         "attention_backend": str(attention_backend),
         "clip_force_quick_gelu": bool(clip_force_quick_gelu),
@@ -221,7 +219,6 @@ def generate_geneval_images_maskgen(
     refine_start_step=10,
     refine_loops=None,
     critic_use_hidden=True,
-    refine_softmax_temperature=0.7,
     repair_greedy=False,
     attention_backend="math",
     clip_force_quick_gelu=True,
@@ -260,7 +257,6 @@ def generate_geneval_images_maskgen(
         refine_start_step=refine_start_step,
         refine_loops=refine_loops,
         critic_use_hidden=critic_use_hidden,
-        refine_softmax_temperature=refine_softmax_temperature,
         repair_greedy=repair_greedy,
         attention_backend=attention_backend,
         clip_force_quick_gelu=clip_force_quick_gelu,
@@ -289,7 +285,6 @@ def generate_geneval_images_maskgen(
             refine_start_step=int(refine_start_step),
             refine_loops=refine_loops,
             critic_use_hidden=bool(critic_use_hidden),
-            refine_softmax_temperature=float(refine_softmax_temperature),
             repair_greedy=bool(repair_greedy),
         )
         if len(images) != int(batch_size):
@@ -319,7 +314,6 @@ def parse_args():
     parser.add_argument("--refine-start-step", type=int, default=10)
     parser.add_argument("--refine-loops", type=_none_or_int, default=None)
     parser.add_argument("--critic-use-hidden", action="store_true")
-    parser.add_argument("--refine-softmax-temperature", type=float, default=0.7)
     parser.add_argument("--repair-greedy", action="store_true")
     parser.add_argument(
         "--attention-backend",
@@ -392,7 +386,6 @@ def main():
         refine_start_step=int(args.refine_start_step),
         refine_loops=args.refine_loops,
         critic_use_hidden=bool(args.critic_use_hidden),
-        refine_softmax_temperature=float(args.refine_softmax_temperature),
         repair_greedy=bool(args.repair_greedy),
         attention_backend=str(args.attention_backend),
         clip_force_quick_gelu=bool(args.clip_force_quick_gelu),
